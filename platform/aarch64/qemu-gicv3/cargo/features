@@ -1,5 +1,7 @@
 gicv3
 pl011
 arm_smmu
+sequential_output
+iommu
 pci
 ecam_pcie
