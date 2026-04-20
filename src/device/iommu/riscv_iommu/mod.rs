@@ -15,7 +15,9 @@
 //      ForeverYolo <2572131118@qq.com>
 //      Jingyu Liu <liujingyu24s@ict.ac.cn>
 
-#![allow(unused)]
+#![deny(unused_variables)]
+#![deny(unused_imports)]
+#![deny(unused_mut)]
 
 // TODO:
 // - [x] Remove iommu from arch to device
@@ -25,20 +27,15 @@
 // - [ ] Support vIOMMU
 // - [ ] Increase more fault tolerance
 
+mod cmd;
 mod iommu_hw;
+mod reg_bits;
 
 use super::Iommu;
-use crate::cpu_data::this_zone;
-use crate::memory::Frame;
 use crate::zone::Zone;
-use alloc::vec::Vec;
+use cmd::*;
 use iommu_hw::*;
-use log::{error, info, warn};
-use spin::{Mutex, Once};
-use tock_registers::interfaces::{Readable, Writeable};
-use tock_registers::register_bitfields;
-use tock_registers::register_structs;
-use tock_registers::registers::{ReadOnly, ReadWrite};
+pub use iommu_hw::{iommu_msi_pt_tlb_invalid, iommu_remove_device};
 
 pub(super) struct RiscvIommu;
 
@@ -49,7 +46,7 @@ impl Iommu for RiscvIommu {
     fn initialize(&self) {
         iommu_init();
     }
-    fn initialize_with_base_and_size(&self, iommu_base: usize, iommu_size: usize) {
+    fn initialize_with_base_and_size(&self, _iommu_base: usize, _iommu_size: usize) {
         todo!("RiscvIommu initialize with base and size not implemented yet.");
     }
     fn add_device_with_root_pt_addr(&self, zone_id: usize, device_id: usize, root_pt: usize) {
@@ -66,7 +63,7 @@ impl Iommu for RiscvIommu {
         &self,
         zone_id: usize,
         device_id: usize,
-        regions: alloc::vec::Vec<crate::memory::MemoryRegion<crate::memory::GuestPhysAddr>>,
+        _regions: alloc::vec::Vec<crate::memory::MemoryRegion<crate::memory::GuestPhysAddr>>,
     ) {
         todo!(
             "RiscvIommu add device with exclusive S2PT for device id {} and VMID {}",
@@ -75,11 +72,7 @@ impl Iommu for RiscvIommu {
         );
     }
     fn remove_device(&self, zone_id: usize, device_id: usize) {
-        todo!(
-            "RiscvIommu remove device for device id {} and VMID {}",
-            device_id,
-            zone_id
-        );
+        iommu_remove_device(zone_id, device_id);
     }
     fn interrupt_handler(&self, irq_id: usize) {
         todo!(
@@ -93,7 +86,7 @@ impl Iommu for RiscvIommu {
             zone_id
         );
     }
-    fn viommu_mmio_handler(&self, zone: &mut Zone, viommu_base: usize, viommu_size: usize) {
+    fn viommu_mmio_handler(&self, zone: &mut Zone, _viommu_base: usize, _viommu_size: usize) {
         todo!(
             "RiscvIommu viommu handler for zone id {} not implemented yet.",
             zone.id()
