@@ -62,6 +62,8 @@ mod platform;
 mod zone;
 
 mod pci;
+mod scheduler;
+mod vcpu;
 
 #[cfg(test)]
 mod tests;

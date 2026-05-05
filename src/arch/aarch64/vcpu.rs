@@ -1,0 +1,507 @@
+// Copyright (c) 2025 Syswonder
+// hvisor is licensed under Mulan PSL v2.
+// You can use this software according to the terms and conditions of the Mulan PSL v2.
+// You may obtain a copy of Mulan PSL v2 at:
+//     http://license.coscl.org.cn/MulanPSL2
+// THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER
+// EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY OR
+// FIT FOR A PARTICULAR PURPOSE.
+// See the Mulan PSL v2 for more details.
+//
+// Syswonder Website:
+//      https://www.syswonder.org
+//
+// Authors:
+//
+
+//! AArch64 vCPU architecture state: EL1 system registers + GIC virtualization state.
+//!
+//! Each VCpu has an `ArchVCpu` that holds:
+//! - `guest_regs`: the general-purpose register frame (same layout as pCPU stack frame,
+//!   compatible with `vmreturn`). Saved/restored on every context switch.
+//! - `el1_regs`: all EL1 system registers (SCTLR, TTBR, TCR, timer regs, etc.)
+//! - `gic_state`: GIC virtualization registers (ICH_LR*, ICH_VMCR, etc.)
+//!
+//! The `guest_regs` layout matches `GeneralRegisters` in `cpu.rs`:
+//!   [exit_reason: u64][x1..x30: u64; 30]  — total 256 bytes
+//! This allows `vmreturn(vcpu.arch.guest_regs_ptr())` to restore guest state correctly.
+
+use crate::arch::cpu::GeneralRegisters;
+use crate::arch::sysreg::{read_sysreg, write_sysreg};
+use alloc::sync::Arc;
+use core::cell::UnsafeCell;
+
+// ========================
+// EL1 System Registers
+// ========================
+
+/// Saved EL1 system register state for a VCpu.
+/// These must be saved/restored on every VCpu context switch.
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct El1SysRegs {
+    pub sctlr_el1: u64,
+    pub ttbr0_el1: u64,
+    pub ttbr1_el1: u64,
+    pub tcr_el1: u64,
+    pub esr_el1: u64,
+    pub far_el1: u64,
+    pub mair_el1: u64,
+    pub amair_el1: u64,
+    pub vbar_el1: u64,
+    pub contextidr_el1: u64,
+    pub cpacr_el1: u64,
+    pub csselr_el1: u64,
+    pub sp_el0: u64,
+    pub sp_el1: u64,
+    pub spsr_el1: u64,
+    pub elr_el1: u64,
+    pub afsr0_el1: u64,
+    pub afsr1_el1: u64,
+    pub par_el1: u64,
+    pub tpidr_el0: u64,
+    pub tpidr_el1: u64,
+    pub tpidrro_el0: u64,
+    // Timer registers (trapped via EL2)
+    pub cntvoff_el2: u64,
+    pub cntp_ctl_el0: u64,
+    pub cntp_cval_el0: u64,
+    pub cntv_ctl_el0: u64,
+    pub cntv_cval_el0: u64,
+    pub cntkctl_el1: u64,
+    // ELR_EL2 and SPSR_EL2 for this vCPU (guest PC + PSTATE)
+    pub elr_el2: u64,
+    pub spsr_el2: u64,
+}
+
+impl Default for El1SysRegs {
+    fn default() -> Self {
+        Self::reset()
+    }
+}
+
+impl El1SysRegs {
+    /// Initialize with ARMv8 reset values.
+    pub fn reset() -> Self {
+        Self {
+            // SCTLR_EL1 reset: bits 11, 20, 22-23, 28-29 set (EOS, TSCXT, EIS, LSMAOE, nTLSMD)
+            sctlr_el1: (1 << 11) | (1 << 20) | (3 << 22) | (3 << 28),
+            ttbr0_el1: 0,
+            ttbr1_el1: 0,
+            tcr_el1: 0,
+            esr_el1: 0,
+            far_el1: 0,
+            mair_el1: 0,
+            amair_el1: 0,
+            vbar_el1: 0,
+            contextidr_el1: 0,
+            cpacr_el1: 0,
+            csselr_el1: 0,
+            sp_el0: 0,
+            sp_el1: 0,
+            spsr_el1: 0,
+            elr_el1: 0,
+            afsr0_el1: 0,
+            afsr1_el1: 0,
+            par_el1: 0,
+            tpidr_el0: 0,
+            tpidr_el1: 0,
+            tpidrro_el0: 0,
+            cntvoff_el2: 0,
+            cntp_ctl_el0: 0,
+            cntp_cval_el0: 0,
+            cntv_ctl_el0: 0,
+            cntv_cval_el0: 0,
+            cntkctl_el1: 0,
+            elr_el2: 0,
+            spsr_el2: 0x3c5, // EL1h, interrupts masked
+        }
+    }
+
+    /// Save all EL1 system registers from hardware into this struct.
+    pub fn save_from_hardware(&mut self) {
+        self.sctlr_el1      = read_sysreg!(SCTLR_EL1);
+        self.ttbr0_el1      = read_sysreg!(TTBR0_EL1);
+        self.ttbr1_el1      = read_sysreg!(TTBR1_EL1);
+        self.tcr_el1        = read_sysreg!(TCR_EL1);
+        self.esr_el1        = read_sysreg!(ESR_EL1);
+        self.far_el1        = read_sysreg!(FAR_EL1);
+        self.mair_el1       = read_sysreg!(MAIR_EL1);
+        self.amair_el1      = read_sysreg!(AMAIR_EL1);
+        self.vbar_el1       = read_sysreg!(VBAR_EL1);
+        self.contextidr_el1 = read_sysreg!(CONTEXTIDR_EL1);
+        self.cpacr_el1      = read_sysreg!(CPACR_EL1);
+        self.csselr_el1     = read_sysreg!(CSSELR_EL1);
+        self.sp_el0         = read_sysreg!(SP_EL0);
+        self.sp_el1         = read_sysreg!(SP_EL1);
+        self.spsr_el1       = read_sysreg!(SPSR_EL1);
+        self.elr_el1        = read_sysreg!(ELR_EL1);
+        self.afsr0_el1      = read_sysreg!(AFSR0_EL1);
+        self.afsr1_el1      = read_sysreg!(AFSR1_EL1);
+        self.par_el1        = read_sysreg!(PAR_EL1);
+        self.tpidr_el0      = read_sysreg!(TPIDR_EL0);
+        self.tpidr_el1      = read_sysreg!(TPIDR_EL1);
+        self.tpidrro_el0    = read_sysreg!(TPIDRRO_EL0);
+        self.cntvoff_el2    = read_sysreg!(CNTVOFF_EL2);
+        self.cntp_ctl_el0   = read_sysreg!(CNTP_CTL_EL0);
+        self.cntp_cval_el0  = read_sysreg!(CNTP_CVAL_EL0);
+        self.cntv_ctl_el0   = read_sysreg!(CNTV_CTL_EL0);
+        self.cntv_cval_el0  = read_sysreg!(CNTV_CVAL_EL0);
+        self.cntkctl_el1    = read_sysreg!(CNTKCTL_EL1);
+        // Save guest PC and PSTATE from ELR_EL2/SPSR_EL2
+        self.elr_el2        = read_sysreg!(ELR_EL2);
+        self.spsr_el2       = read_sysreg!(SPSR_EL2);
+    }
+
+    /// Restore all EL1 system registers from this struct to hardware.
+    pub fn restore_to_hardware(&self) {
+        write_sysreg!(SCTLR_EL1,      self.sctlr_el1);
+        write_sysreg!(TTBR0_EL1,      self.ttbr0_el1);
+        write_sysreg!(TTBR1_EL1,      self.ttbr1_el1);
+        write_sysreg!(TCR_EL1,        self.tcr_el1);
+        write_sysreg!(ESR_EL1,        self.esr_el1);
+        write_sysreg!(FAR_EL1,        self.far_el1);
+        write_sysreg!(MAIR_EL1,       self.mair_el1);
+        write_sysreg!(AMAIR_EL1,      self.amair_el1);
+        write_sysreg!(VBAR_EL1,       self.vbar_el1);
+        write_sysreg!(CONTEXTIDR_EL1, self.contextidr_el1);
+        write_sysreg!(CPACR_EL1,      self.cpacr_el1);
+        write_sysreg!(CSSELR_EL1,     self.csselr_el1);
+        write_sysreg!(SP_EL0,         self.sp_el0);
+        write_sysreg!(SP_EL1,         self.sp_el1);
+        write_sysreg!(SPSR_EL1,       self.spsr_el1);
+        write_sysreg!(ELR_EL1,        self.elr_el1);
+        write_sysreg!(AFSR0_EL1,      self.afsr0_el1);
+        write_sysreg!(AFSR1_EL1,      self.afsr1_el1);
+        write_sysreg!(PAR_EL1,        self.par_el1);
+        write_sysreg!(TPIDR_EL0,      self.tpidr_el0);
+        write_sysreg!(TPIDR_EL1,      self.tpidr_el1);
+        write_sysreg!(TPIDRRO_EL0,    self.tpidrro_el0);
+        write_sysreg!(CNTVOFF_EL2,    self.cntvoff_el2);
+        write_sysreg!(CNTP_CTL_EL0,   self.cntp_ctl_el0);
+        write_sysreg!(CNTP_CVAL_EL0,  self.cntp_cval_el0);
+        write_sysreg!(CNTV_CVAL_EL0,  self.cntv_cval_el0);
+        // Restore virtual timer control.
+        // If timer already expired (ISTATUS=1), mask it so check_blocked_timers
+        // handles wake-up via the software pending path rather than flooding IRQ 27.
+        let cntv_ctl     = self.cntv_ctl_el0;
+        let timer_enabled = (cntv_ctl & 1) != 0;
+        let timer_expired = (cntv_ctl & 4) != 0; // ISTATUS
+        if timer_enabled && timer_expired {
+            write_sysreg!(CNTV_CTL_EL0, cntv_ctl | 2); // set IMASK
+        } else {
+            write_sysreg!(CNTV_CTL_EL0, cntv_ctl);
+        }
+        write_sysreg!(CNTKCTL_EL1, self.cntkctl_el1);
+        write_sysreg!(PMCR_EL0, 0);
+        // Restore guest PC and PSTATE
+        write_sysreg!(ELR_EL2,  self.elr_el2);
+        write_sysreg!(SPSR_EL2, self.spsr_el2);
+    }
+}
+
+// ========================
+// GIC Virtualization State
+// ========================
+
+/// Maximum number of GIC List Registers.
+pub const MAX_GIC_LRS: usize = 16;
+
+/// Per-VCpu virtual GICR (Redistributor) shadow state for SGI/PPI registers.
+/// In overcommit mode, multiple VCPUs share one physical GICR.
+/// This struct holds the software shadow so each VCpu has its own SGI/PPI config.
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct VirtualGicrState {
+    pub isenabler: u32,
+    pub ipriorityr: [u32; 8],
+    pub icfgr: [u32; 2],
+    pub ispendr: u32,
+    pub isactiver: u32,
+    pub igroupr: u32,
+    pub initialized: bool,
+}
+
+impl Default for VirtualGicrState {
+    fn default() -> Self {
+        Self {
+            isenabler: 0,
+            ipriorityr: [0; 8],
+            icfgr: [0; 2],
+            ispendr: 0,
+            isactiver: 0,
+            igroupr: 0,
+            initialized: false,
+        }
+    }
+}
+
+/// Saved GIC virtualization register state for a VCpu.
+#[repr(C)]
+#[derive(Debug)]
+pub struct GicState {
+    pub ich_lr: [u64; MAX_GIC_LRS],
+    pub ich_vmcr: u64,
+    pub ich_hcr: u64,
+    pub ich_ap1r: [u64; 4],
+    /// Number of LRs available on this hardware (detected from ICH_VTR_EL2).
+    pub lr_count: usize,
+    /// Number of preemption priority bits (from ICH_VTR_EL2.PREbits+1).
+    pub pri_bits: usize,
+    /// Per-VCpu virtual GICR SGI/PPI state (shadow of physical GICR).
+    pub vgicr: UnsafeCell<VirtualGicrState>,
+}
+
+// Safety: VirtualGicrState is only mutated when the VCpu is NOT running.
+unsafe impl Send for GicState {}
+unsafe impl Sync for GicState {}
+
+impl Clone for GicState {
+    fn clone(&self) -> Self {
+        Self {
+            ich_lr:   self.ich_lr,
+            ich_vmcr: self.ich_vmcr,
+            ich_hcr:  self.ich_hcr,
+            ich_ap1r: self.ich_ap1r,
+            lr_count: self.lr_count,
+            pri_bits: self.pri_bits,
+            vgicr:    UnsafeCell::new(unsafe { (*self.vgicr.get()).clone() }),
+        }
+    }
+}
+
+impl Default for GicState {
+    fn default() -> Self {
+        Self {
+            ich_lr:   [0; MAX_GIC_LRS],
+            ich_vmcr: 0,
+            ich_hcr:  0,
+            ich_ap1r: [0; 4],
+            lr_count: 0,
+            pri_bits: 5,
+            vgicr:    UnsafeCell::new(VirtualGicrState::default()),
+        }
+    }
+}
+
+impl GicState {
+    /// Create a new GicState with lr_count/pri_bits detected from hardware.
+    /// ICH_HCR_EL2.En=1 so the virtual GIC interface is active on first schedule-in.
+    pub fn new_with_lr_count(lr_count: usize) -> Self {
+        // ICH_VMCR_EL2: VPMR=0xff (allow all priorities), VENG1=1 (Group1 enabled)
+        let ich_vmcr_default: u64 = (0xff_u64 << 24) | (1 << 1);
+        let pri_bits = detect_gic_pri_bits();
+        Self {
+            lr_count,
+            pri_bits,
+            ich_hcr: 1, // En=1
+            ich_vmcr: ich_vmcr_default,
+            ..Default::default()
+        }
+    }
+
+    /// Save GIC virtualization registers from hardware.
+    pub fn save_from_hardware(&mut self) {
+        self.ich_vmcr    = read_sysreg!(ICH_VMCR_EL2);
+        self.ich_hcr     = read_sysreg!(ICH_HCR_EL2);
+        self.ich_ap1r[0] = read_sysreg!(ICH_AP1R0_EL2);
+        if self.pri_bits >= 6 { self.ich_ap1r[1] = read_sysreg!(ICH_AP1R1_EL2); }
+        if self.pri_bits >= 7 {
+            self.ich_ap1r[2] = read_sysreg!(ICH_AP1R2_EL2);
+            self.ich_ap1r[3] = read_sysreg!(ICH_AP1R3_EL2);
+        }
+        if self.lr_count > 0  { self.ich_lr[0]  = read_sysreg!(ICH_LR0_EL2);  }
+        if self.lr_count > 1  { self.ich_lr[1]  = read_sysreg!(ICH_LR1_EL2);  }
+        if self.lr_count > 2  { self.ich_lr[2]  = read_sysreg!(ICH_LR2_EL2);  }
+        if self.lr_count > 3  { self.ich_lr[3]  = read_sysreg!(ICH_LR3_EL2);  }
+        if self.lr_count > 4  { self.ich_lr[4]  = read_sysreg!(ICH_LR4_EL2);  }
+        if self.lr_count > 5  { self.ich_lr[5]  = read_sysreg!(ICH_LR5_EL2);  }
+        if self.lr_count > 6  { self.ich_lr[6]  = read_sysreg!(ICH_LR6_EL2);  }
+        if self.lr_count > 7  { self.ich_lr[7]  = read_sysreg!(ICH_LR7_EL2);  }
+        if self.lr_count > 8  { self.ich_lr[8]  = read_sysreg!(ICH_LR8_EL2);  }
+        if self.lr_count > 9  { self.ich_lr[9]  = read_sysreg!(ICH_LR9_EL2);  }
+        if self.lr_count > 10 { self.ich_lr[10] = read_sysreg!(ICH_LR10_EL2); }
+        if self.lr_count > 11 { self.ich_lr[11] = read_sysreg!(ICH_LR11_EL2); }
+        if self.lr_count > 12 { self.ich_lr[12] = read_sysreg!(ICH_LR12_EL2); }
+        if self.lr_count > 13 { self.ich_lr[13] = read_sysreg!(ICH_LR13_EL2); }
+        if self.lr_count > 14 { self.ich_lr[14] = read_sysreg!(ICH_LR14_EL2); }
+        if self.lr_count > 15 { self.ich_lr[15] = read_sysreg!(ICH_LR15_EL2); }
+    }
+
+    /// Restore GIC virtualization registers to hardware.
+    pub fn restore_to_hardware(&self) {
+        write_sysreg!(ICH_VMCR_EL2,   self.ich_vmcr);
+        write_sysreg!(ICH_HCR_EL2,    self.ich_hcr);
+        write_sysreg!(ICH_AP1R0_EL2,  self.ich_ap1r[0]);
+        if self.pri_bits >= 6 { write_sysreg!(ICH_AP1R1_EL2, self.ich_ap1r[1]); }
+        if self.pri_bits >= 7 {
+            write_sysreg!(ICH_AP1R2_EL2, self.ich_ap1r[2]);
+            write_sysreg!(ICH_AP1R3_EL2, self.ich_ap1r[3]);
+        }
+        if self.lr_count > 0  { write_sysreg!(ICH_LR0_EL2,  self.ich_lr[0]);  }
+        if self.lr_count > 1  { write_sysreg!(ICH_LR1_EL2,  self.ich_lr[1]);  }
+        if self.lr_count > 2  { write_sysreg!(ICH_LR2_EL2,  self.ich_lr[2]);  }
+        if self.lr_count > 3  { write_sysreg!(ICH_LR3_EL2,  self.ich_lr[3]);  }
+        if self.lr_count > 4  { write_sysreg!(ICH_LR4_EL2,  self.ich_lr[4]);  }
+        if self.lr_count > 5  { write_sysreg!(ICH_LR5_EL2,  self.ich_lr[5]);  }
+        if self.lr_count > 6  { write_sysreg!(ICH_LR6_EL2,  self.ich_lr[6]);  }
+        if self.lr_count > 7  { write_sysreg!(ICH_LR7_EL2,  self.ich_lr[7]);  }
+        if self.lr_count > 8  { write_sysreg!(ICH_LR8_EL2,  self.ich_lr[8]);  }
+        if self.lr_count > 9  { write_sysreg!(ICH_LR9_EL2,  self.ich_lr[9]);  }
+        if self.lr_count > 10 { write_sysreg!(ICH_LR10_EL2, self.ich_lr[10]); }
+        if self.lr_count > 11 { write_sysreg!(ICH_LR11_EL2, self.ich_lr[11]); }
+        if self.lr_count > 12 { write_sysreg!(ICH_LR12_EL2, self.ich_lr[12]); }
+        if self.lr_count > 13 { write_sysreg!(ICH_LR13_EL2, self.ich_lr[13]); }
+        if self.lr_count > 14 { write_sysreg!(ICH_LR14_EL2, self.ich_lr[14]); }
+        if self.lr_count > 15 { write_sysreg!(ICH_LR15_EL2, self.ich_lr[15]); }
+    }
+}
+
+/// Detect number of GIC List Registers from ICH_VTR_EL2.
+pub fn detect_gic_lr_count() -> usize {
+    let vtr = read_sysreg!(ICH_VTR_EL2);
+    // ICH_VTR_EL2[4:0] = ListRegs - 1
+    ((vtr & 0x1f) + 1) as usize
+}
+
+/// Detect number of priority bits from ICH_VTR_EL2.PREbits[28:26].
+pub fn detect_gic_pri_bits() -> usize {
+    let vtr = read_sysreg!(ICH_VTR_EL2);
+    (((vtr >> 26) & 0x7) + 1) as usize
+}
+
+// ========================
+// ArchVCpu
+// ========================
+
+/// Per-VCpu architecture state for AArch64.
+///
+/// `guest_regs` uses the same layout as the pCPU stack frame saved by trap.S:
+///   offset 0: exit_reason (u64, zeroed on vcpu_switch_in)
+///   offset 8: x1..x30 (u64; 30)
+/// Total: 32 × 8 = 256 bytes.
+///
+/// On vcpu_switch_out: the registers currently on the pCPU stack (at `stack_top - 256`)
+/// are copied into `guest_regs`.
+/// On vcpu_switch_in: `guest_regs` is copied back to the pCPU stack, then
+/// `vmreturn(stack_frame_ptr)` is called.
+#[repr(C)]
+pub struct ArchVCpu {
+    /// Saved guest general-purpose registers. Same layout as `GeneralRegisters`.
+    pub guest_regs: GeneralRegisters,
+    /// Saved EL1 system registers (SCTLR, TTBR, TCR, timer, etc.) + ELR/SPSR.
+    pub el1_regs: El1SysRegs,
+    /// Saved GIC virtualization state (ICH_LR*, ICH_VMCR, vGICR shadow).
+    pub gic_state: GicState,
+}
+
+impl ArchVCpu {
+    pub fn new() -> Self {
+        let lr_count = safe_detect_gic_lr_count();
+        Self {
+            guest_regs: GeneralRegisters { exit_reason: 0, usr: [0; 31] },
+            el1_regs:   El1SysRegs::reset(),
+            gic_state:  GicState::new_with_lr_count(lr_count),
+        }
+    }
+
+    /// Reset EL1 regs to ARMv8 architectural reset values (for PSCI CPU_ON hotplug).
+    /// Only call when the VCpu is in Stopped state — not thread-safe.
+    pub fn reset_el1_regs(&self) {
+        unsafe {
+            core::ptr::write(
+                core::ptr::addr_of!(self.el1_regs) as *mut El1SysRegs,
+                El1SysRegs::reset(),
+            );
+        }
+    }
+
+    /// Reset GIC state to initial values (for PSCI CPU_ON hotplug).
+    pub fn reset_gic_state(&self) {
+        unsafe {
+            core::ptr::write(
+                core::ptr::addr_of!(self.gic_state) as *mut GicState,
+                GicState::new_with_lr_count(safe_detect_gic_lr_count()),
+            );
+        }
+    }
+
+    /// Returns a raw pointer to `guest_regs`, suitable for passing to `vmreturn`.
+    pub fn guest_regs_ptr(&self) -> usize {
+        core::ptr::addr_of!(self.guest_regs) as usize
+    }
+}
+
+/// Safely detect GIC LR count. Falls back to 4 if hardware is not ready.
+fn safe_detect_gic_lr_count() -> usize {
+    detect_gic_lr_count()
+}
+
+pub type ArchVCpuType = ArchVCpu;
+
+// ========================
+// arch_wakeup_vcpu
+// ========================
+
+/// Transition a vCPU from Stopped → Ready and deliver it to its affinity pCPU.
+/// Used by PSCI CPU_ON emulation.
+pub fn arch_wakeup_vcpu(vcpu: Arc<crate::vcpu::VCpu>) -> isize {
+    use crate::vcpu::VCpuState;
+
+    if vcpu.transition(VCpuState::Stopped, VCpuState::Ready).is_err() {
+        error!(
+            "PSCI: vcpu {} is not in Stopped state (current: {:?})",
+            vcpu.id,
+            vcpu.state()
+        );
+        return -4; // PSCI_ALREADY_ON
+    }
+
+    let from_pcpu = crate::cpu_data::this_cpu_data().id;
+    let target_pcpu = vcpu.get_pcpu_affinity();
+    info!(
+        "PSCI: wakeup vcpu {} -> pCPU {} (from pCPU {})",
+        vcpu.id, target_pcpu, from_pcpu
+    );
+
+    if target_pcpu != from_pcpu {
+        crate::vcpu::deliver_vcpu_to_pcpu(target_pcpu, vcpu);
+    } else {
+        crate::vcpu::enqueue_vcpu_on_affinity_pcpu(vcpu);
+    }
+
+    0
+}
+
+// ========================
+// GICR shadow write-back (called from vcpu_switch_in in scheduler.rs)
+// ========================
+
+/// Write the saved vGICR shadow registers back to the physical GICR.
+/// Restores per-VCpu SGI/PPI configuration (IGROUPR0, ISENABLER0, IPRIORITYR, ICFGR1).
+pub fn restore_vgicr(vcpu: &crate::vcpu::VCpu) {
+    use crate::device::irqchip::gicv3::{gicr, host_gicr_base};
+
+    let pcpu_id = vcpu.get_pcpu_affinity();
+    let sgi_base = host_gicr_base(pcpu_id) + gicr::GICR_SGI_BASE;
+    let vgicr = unsafe { &*vcpu.arch.gic_state.vgicr.get() };
+    if !vgicr.initialized {
+        return;
+    }
+    unsafe {
+        let igroupr = (sgi_base + gicr::GICR_IGROUPR) as *mut u32;
+        igroupr.write_volatile(vgicr.igroupr);
+
+        let isenabler = (sgi_base + gicr::GICR_ISENABLER) as *mut u32;
+        isenabler.write_volatile(vgicr.isenabler);
+
+        for i in 0..8 {
+            let reg = (sgi_base + gicr::GICR_IPRIORITYR + i * 4) as *mut u32;
+            reg.write_volatile(vgicr.ipriorityr[i]);
+        }
+
+        // ICFGR0 (SGIs) is read-only, only write ICFGR1 (PPIs)
+        let icfgr1 = (sgi_base + gicr::GICR_ICFGR + 4) as *mut u32;
+        icfgr1.write_volatile(vgicr.icfgr[1]);
+    }
+}

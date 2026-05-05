@@ -30,6 +30,10 @@ pub const IPI_EVENT_WAKEUP: usize = 0;
 pub const IPI_EVENT_SHUTDOWN: usize = 1;
 pub const IPI_EVENT_VIRTIO_INJECT_IRQ: usize = 2;
 pub const IPI_EVENT_WAKEUP_VIRTIO_DEVICE: usize = 3;
+/// Tell target pCPU to call drain_pending_wake_ids() + schedule().
+pub const IPI_EVENT_RESCHED: usize = 10;
+/// New vCPU arrived in incoming_vcpus queue; drain and schedule.
+pub const IPI_EVENT_INCOMING_VCPU: usize = 11;
 
 #[percpu::def_percpu]
 static PERCPU_EVENTS: Mutex<VecDeque<usize>> = Mutex::new(VecDeque::new());
@@ -101,6 +105,24 @@ pub fn check_events() -> bool {
         }
         Some(IPI_EVENT_WAKEUP_VIRTIO_DEVICE) => {
             inject_irq(IRQ_WAKEUP_VIRTIO_DEVICE, false);
+            true
+        }
+        Some(IPI_EVENT_RESCHED) => {
+            crate::vcpu::drain_pending_wake_ids();
+            #[cfg(target_arch = "aarch64")]
+            {
+                // stack_regs_ptr is unavailable here (we're in IPI context, not a trap frame).
+                // The actual schedule() call will happen at the next arch_handle_exit check.
+                cpu_data.need_resched.store(true, core::sync::atomic::Ordering::Release);
+            }
+            true
+        }
+        Some(IPI_EVENT_INCOMING_VCPU) => {
+            crate::vcpu::drain_incoming_vcpus();
+            #[cfg(target_arch = "aarch64")]
+            {
+                cpu_data.need_resched.store(true, core::sync::atomic::Ordering::Release);
+            }
             true
         }
         Some(IPI_EVENT_CLEAR_INJECT_IRQ)

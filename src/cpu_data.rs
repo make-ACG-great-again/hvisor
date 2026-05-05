@@ -13,16 +13,28 @@
 //
 // Authors:
 //
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use spin::Mutex;
 
 use crate::arch::cpu::{store_cpu_pointer_to_reg, this_cpu_id, ArchCpu};
 use crate::consts::{INVALID_ADDRESS, PER_CPU_ARRAY_PTR, PER_CPU_SIZE};
 use crate::memory::addr::VirtAddr;
+use crate::scheduler::PerCpuScheduler;
+use crate::vcpu::VCpu;
 use crate::zone::Zone;
 use crate::ENTERED_CPUS;
 use core::fmt::Debug;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// A pending cross-pCPU SGI wake-up request.
+#[derive(Clone, Debug)]
+pub struct PendingWake {
+    pub vcpu_id: usize,
+    pub irq_id: usize,
+    /// true for physical SPI/PPI (GIC LR.HW=1), false for virtual-only (SGI, synthetic timer)
+    pub is_hardware: bool,
+}
 
 // global_asm!(include_str!("./arch/aarch64/page_table.S"),);
 
@@ -35,12 +47,32 @@ pub struct PerCpu {
     pub zone: Option<Arc<Zone>>,
     pub ctrl_lock: Mutex<()>,
     pub boot_cpu: bool,
-    // percpu stack
+    // --- vCPU scheduler fields ---
+    /// Per-pCPU scheduler with 4-level priority queues.
+    pub scheduler: PerCpuScheduler,
+    /// Set to true when a context switch is needed (by timer tick or IPI).
+    pub need_resched: AtomicBool,
+    /// Currently running vCPU on this pCPU (None if idle or no vCPU assigned).
+    pub current_vcpu: Option<Arc<VCpu>>,
+    /// Incoming vCPU queue for PSCI CPU_ON cross-pCPU delivery.
+    /// Sender pushes Arc<VCpu> then sends IPI_EVENT_INCOMING_VCPU.
+    pub incoming_vcpus: Mutex<VecDeque<Arc<VCpu>>>,
+    /// Pending cross-pCPU SGI wake-up requests.
+    /// IPI_EVENT_RESCHED handler drains this: injects IRQ and enqueues target vCPU.
+    pub pending_wake_ids: Mutex<VecDeque<PendingWake>>,
+    // percpu stack (implicit, from struct end to PER_CPU_SIZE boundary)
 }
 
 impl PerCpu {
     pub fn new<'a>(cpu_id: usize) -> &'static mut PerCpu {
         let arch_cpu = ArchCpu::new(cpu_id);
+        // if cpu_id == 0 {
+        //     println!("PerCpu size = {} bytes, PER_CPU_SIZE = {} bytes, stack available = {} bytes",
+        //         core::mem::size_of::<PerCpu>(),
+        //         PER_CPU_SIZE,
+        //         PER_CPU_SIZE.saturating_sub(core::mem::size_of::<PerCpu>()),
+        //     );
+        // }
         let vaddr = PER_CPU_ARRAY_PTR as VirtAddr + arch_cpu.cpuid as usize * PER_CPU_SIZE;
         let ret = vaddr as *mut Self;
         unsafe {
@@ -52,6 +84,11 @@ impl PerCpu {
                 zone: None,
                 ctrl_lock: Mutex::new(()),
                 boot_cpu: false,
+                scheduler: PerCpuScheduler::new(),
+                need_resched: AtomicBool::new(false),
+                current_vcpu: None,
+                incoming_vcpus: Mutex::new(VecDeque::new()),
+                pending_wake_ids: Mutex::new(VecDeque::new()),
             })
         };
         unsafe {
@@ -70,12 +107,48 @@ impl PerCpu {
     }
 
     pub fn run_vm(&mut self) {
-        if !self.boot_cpu {
-            info!("CPU{}: Idling the CPU before starting VM...", self.id);
-            self.arch_cpu.idle();
+        // With vCPU scheduler: enter the schedule loop instead of directly running.
+        // schedule() picks the first Ready vCPU from the run queue, sets up context,
+        // then calls vmreturn → guest.  Non-boot pCPUs may have no vCPU ready yet,
+        // in which case schedule() enters el2_idle_loop and waits for an IPI.
+        #[cfg(target_arch = "aarch64")]
+        {
+            use crate::arch::timer::{el2_timer_init, SCHED_TICK_PERIOD_US};
+            // Initialize the EL2 timer (IRQ 26) for scheduling ticks on this pCPU.
+            // Each pCPU initialises its own CNTHP independently.
+            el2_timer_init(SCHED_TICK_PERIOD_US);
+
+            info!("CPU{}: entering vCPU schedule loop", self.id);
+            self.arch_cpu.power_on = true;
+            self.need_resched.store(true, core::sync::atomic::Ordering::Release);
+
+            // Build a minimal "idle" GeneralRegisters on the stack to satisfy
+            // vcpu_switch_out's stack_regs_ptr on the very first schedule() call.
+            // vcpu_switch_out copies this into the outgoing vCPU's guest_regs,
+            // but since current_vcpu is None on first entry, switch_out is skipped.
+            // We still need a valid pointer — use the pCPU stack frame location.
+            use crate::arch::aarch64::trap::vmreturn;
+            use crate::consts::{PER_CPU_ARRAY_PTR, PER_CPU_SIZE};
+            use crate::memory::addr::VirtAddr;
+            let stack_top = PER_CPU_ARRAY_PTR as VirtAddr + (self.id + 1) * PER_CPU_SIZE;
+            let stack_regs_ptr = stack_top - 32 * 8;
+            loop {
+                crate::scheduler::schedule(stack_regs_ptr);
+                // schedule() → vcpu_switch_in() copied guest_regs → pCPU stack frame.
+                // vmreturn(stack_regs_ptr) loads regs from there and eret, leaving
+                // SP_EL2 = stack_top (correct for the next trap's handle_vmexit push).
+                unsafe { vmreturn(stack_regs_ptr) }
+            }
         }
-        info!("CPU{}: Running the VM...", self.id);
-        self.arch_cpu.run();
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            if !self.boot_cpu {
+                info!("CPU{}: Idling the CPU before starting VM...", self.id);
+                self.arch_cpu.idle();
+            }
+            info!("CPU{}: Running the VM...", self.id);
+            self.arch_cpu.run();
+        }
     }
 
     pub fn entered_cpus() -> u32 {
