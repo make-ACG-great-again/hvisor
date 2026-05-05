@@ -109,7 +109,14 @@ pub fn gicv3_handle_irq_el1() {
             warn!("skip sgi {}", irq_id);
             deactivate_irq(irq_id);
         } else {
-            if irq_id == 27 {
+            if irq_id == 26 {
+                // EL2 physical timer (CNTHP) — scheduling tick, private to hypervisor.
+                // Must NOT be injected into the guest.
+                deactivate_irq(irq_id);
+                #[cfg(target_arch = "aarch64")]
+                crate::arch::timer::sched_tick_handler();
+                continue;
+            } else if irq_id == 27 {
                 // virtual timer interrupt
                 TIMER_INTERRUPT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
                 if TIMER_INTERRUPT_COUNTER.load(core::sync::atomic::Ordering::SeqCst)

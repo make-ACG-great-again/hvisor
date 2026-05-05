@@ -26,7 +26,9 @@ pub mod paging;
 pub mod s2pt;
 pub mod sysreg;
 pub mod time;
+pub mod timer;
 pub mod trap;
+pub mod vcpu;
 pub mod zone;
 
 pub use s2pt::stage2_mode_detect;

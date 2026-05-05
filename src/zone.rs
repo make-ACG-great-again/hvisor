@@ -13,12 +13,33 @@
 //
 // Authors:
 //
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 // use psci::error::INVALID_ADDRESS;
 use crate::consts::{INVALID_ADDRESS, MAX_CPU_NUM};
 use crate::pci::pci_struct::VirtualRootComplex;
 use spin::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+// ========================
+// GuestMpidr
+// ========================
+
+/// Guest-visible virtual MPIDR value (zone-local, starts from 0).
+///
+/// This is distinct from the physical MPIDR (MPIDR_EL1) and the pCPU index.
+/// PSCI CPU_ON passes a guest MPIDR — we must look it up via `guest_mpidr_to_vcpu`,
+/// NOT via `mpidr_to_cpuid()` which resolves physical MPIDRs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GuestMpidr(pub u64);
+
+impl GuestMpidr {
+    /// Create from a raw MPIDR value, masking to affinity fields only.
+    pub fn new(raw: u64) -> Self {
+        // Mask: Aff3[39:32], Aff2[23:16], Aff1[15:8], Aff0[7:0]
+        Self(raw & 0x00_00FF_00FF_FF_FF)
+    }
+}
 
 #[cfg(feature = "dwc_pcie")]
 use crate::pci::{config_accessors::dwc_atu::AtuConfig, PciConfigAddress};
@@ -125,6 +146,15 @@ pub struct ZoneInner {
     vpci_bus: VirtualRootComplex,
     #[cfg(feature = "dwc_pcie")]
     atu_configs: VirtualAtuConfigs,
+    // --- vCPU fields ---
+    /// Global vCPU ID of the first vCPU in this zone.
+    /// Used to compute zone-local index for VMPIDR_EL2.
+    vcpu_base: usize,
+    /// All vCPUs belonging to this zone, keyed by global vcpu_id.
+    vcpus: BTreeMap<usize, Arc<crate::vcpu::VCpu>>,
+    /// Mapping from guest-visible MPIDR to global vcpu_id.
+    /// Used by PSCI CPU_ON to find the target vCPU.
+    guest_mpidr_to_vcpu: BTreeMap<GuestMpidr, usize>,
 }
 
 impl Zone {
@@ -165,6 +195,12 @@ impl Zone {
     pub fn cpu_set(&self) -> CpuSet {
         self.read().cpu_set()
     }
+
+    /// Returns the global vCPU ID of the first vCPU in this zone.
+    /// Used to compute zone-local index for VMPIDR_EL2.
+    pub fn vcpu_base(&self) -> usize {
+        self.read().vcpu_base()
+    }
 }
 
 impl ZoneInner {
@@ -183,6 +219,9 @@ impl ZoneInner {
             vpci_bus: VirtualRootComplex::new(),
             #[cfg(feature = "dwc_pcie")]
             atu_configs: VirtualAtuConfigs::new(),
+            vcpu_base: usize::MAX,
+            vcpus: BTreeMap::new(),
+            guest_mpidr_to_vcpu: BTreeMap::new(),
         }
     }
 
@@ -282,6 +321,22 @@ impl ZoneInner {
 
     pub fn irq_bitmap_mut(&mut self) -> &mut [u32; 1024 / 32] {
         &mut self.irq_bitmap
+    }
+
+    // --- vCPU accessors ---
+
+    pub fn vcpu_base(&self) -> usize {
+        self.vcpu_base
+    }
+
+    pub fn vcpus(&self) -> &BTreeMap<usize, Arc<crate::vcpu::VCpu>> {
+        &self.vcpus
+    }
+
+    /// Look up a vCPU by guest-visible MPIDR. Used by PSCI CPU_ON.
+    pub fn get_vcpu_by_guest_mpidr(&self, mpidr: GuestMpidr) -> Option<Arc<crate::vcpu::VCpu>> {
+        let vcpu_id = *self.guest_mpidr_to_vcpu.get(&mpidr)?;
+        self.vcpus.get(&vcpu_id).cloned()
     }
 
     pub fn gpm(&self) -> &MemorySet<Stage2PageTable> {
@@ -487,6 +542,70 @@ pub fn zone_create(config: &HvZoneConfig) -> HvResult<Arc<Zone>> {
                 cpu_data.arch_cpu.is_aarch32 = config.arch_config.is_aarch32 != 0;
             }
         });
+    }
+
+    // Create one vCPU per pCPU in cpu_set, set affinity, register guest MPIDR mapping,
+    // and enqueue each vCPU onto its affinity pCPU's scheduler.
+    #[cfg(target_arch = "aarch64")]
+    {
+        use crate::vcpu::{VCpu, VCpuState};
+
+        let mut vcpu_base = usize::MAX;
+        let mut local_idx: u64 = 0;
+
+        for cpuid in cpu_set.iter() {
+            let vcpu = Arc::new(VCpu::new(new_zone_pointer.clone()));
+
+            // Record the first vCPU id as vcpu_base
+            if vcpu_base == usize::MAX {
+                vcpu_base = vcpu.id;
+            }
+
+            vcpu.set_pcpu_affinity(cpuid);
+
+            // Guest MPIDR for this vCPU: zone-local index in Aff0 field
+            let guest_mpidr = GuestMpidr::new(local_idx);
+
+            // Register in zone's vCPU map
+            {
+                let mut inner = new_zone_pointer.write();
+                inner.vcpus.insert(vcpu.id, vcpu.clone());
+                inner.guest_mpidr_to_vcpu.insert(guest_mpidr, vcpu.id);
+            }
+
+            // Boot vCPU (local_idx == 0) starts in Ready state immediately.
+            // Secondary vCPUs start Stopped; PSCI CPU_ON will wake them.
+            if local_idx == 0 {
+                // Set guest entry point (ELR_EL2) and initial x0 = dtb_ipa (Linux convention).
+                info!("boot vcpu={} entry_point={:#x} dtb_ipa={:#x}", vcpu.id, config.entry_point, dtb_ipa);
+                unsafe {
+                    let regs = core::ptr::addr_of!(vcpu.arch.el1_regs) as *mut crate::arch::vcpu::El1SysRegs;
+                    (*regs).elr_el2 = config.entry_point;
+                    info!("el1_regs.elr_el2 after write = {:#x}", (*regs).elr_el2);
+                    info!("el1_regs.spsr_el2 after write = {:#x}", (*regs).spsr_el2);
+                    // vmreturn layout: ldp x1,x0,[sp],#16 — first pair is (exit_reason, usr[0]).
+                    // exit_reason → hardware x1 (discarded), usr[0] → hardware x0.
+                    // So Linux x0 (dtb address) maps to guest_regs.usr[0].
+                    let guest = core::ptr::addr_of!(vcpu.arch.guest_regs) as *mut crate::arch::cpu::GeneralRegisters;
+                    (*guest).usr[0] = dtb_ipa as u64;
+                }
+                let _ = vcpu.transition(VCpuState::Stopped, VCpuState::Ready);
+                let cpu_data = get_cpu_data(cpuid);
+                cpu_data.scheduler.enqueue(vcpu.clone());
+            }
+
+            local_idx += 1;
+        }
+
+        // Store vcpu_base in zone
+        new_zone_pointer.write().vcpu_base = vcpu_base;
+
+        info!(
+            "zone {}: created {} vCPU(s), vcpu_base={}",
+            zone_id,
+            local_idx,
+            vcpu_base
+        );
     }
 
     Ok(new_zone_pointer)

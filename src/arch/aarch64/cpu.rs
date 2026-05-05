@@ -103,7 +103,7 @@ impl ArchCpu {
         self.activate_vmm();
     }
 
-    fn activate_vmm(&self) {
+    pub fn activate_vmm(&self) {
         VTCR_EL2.write(
             VTCR_EL2::TG0::Granule4KB
                 + VTCR_EL2::PS.val(get_parange() as _)

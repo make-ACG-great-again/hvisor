@@ -13,7 +13,7 @@
 //
 // Authors:
 //
-use aarch64_cpu::{asm::wfi, registers::*};
+use aarch64_cpu::registers::*;
 use core::arch::global_asm;
 
 use super::cpu::GeneralRegisters;
@@ -29,13 +29,25 @@ use crate::{
     event::{send_event, IPI_EVENT_SHUTDOWN, IPI_EVENT_WAKEUP},
     hypercall::{HyperCall, SGI_IPI_ID},
     memory::{mmio_handle_access, MMIOAccess},
-    zone::{is_this_root_zone, remove_zone},
+    vcpu::VCpuState,
+    zone::{is_this_root_zone, remove_zone, GuestMpidr},
 };
 
 global_asm!(
     include_str!("./trap.S"),
-    sym arch_handle_exit
+    sym arch_handle_exit,
+    sym el2_irq_handler
 );
+
+/// Lightweight EL2 IRQ handler called from _el2_irq_handler in trap.S.
+///
+/// Invoked when an IRQ arrives while the CPU is at EL2 (idle loop or first entry).
+/// Processes the interrupt via GIC and returns — trap.S then eret back to EL2 code.
+/// Must NOT call vmreturn or schedule.
+#[no_mangle]
+extern "C" fn el2_irq_handler() {
+    crate::device::irqchip::gic_handle_irq();
+}
 
 #[allow(dead_code)]
 #[allow(non_snake_case)]
@@ -117,11 +129,34 @@ pub fn arch_handle_exit(regs: &mut GeneralRegisters) -> ! {
         ExceptionType::EXIT_REASON_EL1_ABORT | ExceptionType::EXIT_REASON_EL1_AARCH32_ABORT => {
             arch_handle_trap_el1(regs)
         }
-        ExceptionType::EXIT_REASON_EL2_ABORT => arch_handle_trap_el2(regs),
+        ExceptionType::EXIT_REASON_EL2_ABORT => {
+            let cpu = this_cpu_data();
+            println!(
+                "EL2 ABORT on pcpu={} current_vcpu={:?} ELR={:#x} ESR={:#x}",
+                cpu.id,
+                cpu.current_vcpu.as_ref().map(|v| v.id),
+                read_sysreg!(ELR_EL2),
+                read_sysreg!(ESR_EL2),
+            );
+            arch_handle_trap_el2(regs)
+        }
         ExceptionType::EXIT_REASON_EL2_IRQ => irqchip_handle_irq2(),
         _ => arch_dump_exit(regs.exit_reason),
     }
-    unsafe { vmreturn(regs as *const _ as usize) }
+
+    // Check if a vCPU context switch is needed.
+    // `regs` points to the pCPU stack frame (stack_top - 256) — this is the
+    // "current guest register snapshot" that vcpu_switch_out will copy from.
+    let stack_regs_ptr = regs as *const _ as usize;
+    let cpu = this_cpu_data();
+    if cpu.need_resched.load(core::sync::atomic::Ordering::Acquire) {
+        crate::scheduler::schedule(stack_regs_ptr);
+    }
+
+    // schedule() → vcpu_switch_in() already copied the selected vCPU's guest_regs
+    // to the pCPU stack frame at stack_regs_ptr.  Always vmreturn from there so
+    // SP_EL2 ends up at stack_top after eret (not pointing into the vCPU heap).
+    unsafe { vmreturn(stack_regs_ptr) }
 }
 
 fn irqchip_handle_irq1() {
@@ -187,12 +222,17 @@ fn arch_handle_trap_el2(_regs: &mut GeneralRegisters) {
         }
         _ => {
             println!(
-                "Unhandled EL2 Exception: EC={:#x?}",
-                ESR_EL2.read(ESR_EL2::EC)
+                "Unhandled EL2 Exception: EC={:#x} ELR={:#x} ESR={:#x} FAR={:#x}",
+                ESR_EL2.read(ESR_EL2::EC), elr, esr, far
             );
         }
     }
     loop {}
+}
+
+fn arch_dump_el2_state() {
+    println!("  SPSR_EL2={:#x} ELR_EL2={:#x}", read_sysreg!(SPSR_EL2), read_sysreg!(ELR_EL2));
+    println!("  ESR_EL2={:#x} FAR_EL2={:#x} HPFAR_EL2={:#x}", read_sysreg!(ESR_EL2), read_sysreg!(FAR_EL2), read_sysreg!(HPFAR_EL2));
 }
 
 fn handle_iabt(_regs: &mut GeneralRegisters) {
@@ -257,21 +297,115 @@ fn handle_dabt(regs: &mut GeneralRegisters) {
 }
 
 fn handle_sysreg(regs: &mut GeneralRegisters) {
-    //TODO check sysreg type
-    //send sgi
     trace!("esr_el2: iss {:#x?}", ESR_EL2.read(ESR_EL2::ISS));
     let rt = (ESR_EL2.get() >> 5) & 0x1f;
     let val = regs.usr[rt as usize];
-    trace!("esr_el2 rt{}: {:#x?}", rt, val);
-    let sgi_id: u64 = (val & (0xf << 24)) >> 24;
-    if !this_cpu_data().arch_cpu.power_on {
-        warn!("skip send sgi {:#x?}", sgi_id);
+    let sgi_id = ((val >> 24) & 0xf) as usize;
+    handle_guest_sgi(val, sgi_id);
+    arch_skip_instruction(regs);
+}
+
+/// Virtualise a guest write to ICC_SGI1R_EL1 / ICC_SGI0R_EL1 / ICC_ASGI1R_EL1.
+///
+/// Hardware passthrough is unsafe: `val` encodes guest MPIDRs (virtual) in its
+/// affinity fields. When the target vCPU is Blocked (WFI), a physical SGI lands
+/// at EL2 and is consumed by _el2_irq_handler — never reaching the guest GIC LR.
+/// We must emulate delivery entirely in software.
+fn handle_guest_sgi(val: u64, sgi_id: usize) {
+    let irm         = (val >> 40) & 1;
+    let aff3        = (val >> 44) & 0xf;
+    let aff2        = (val >> 32) & 0xff;
+    let aff1        = (val >> 16) & 0xff;
+    let target_list =  val        & 0xffff;
+
+    let cpu = this_cpu_data();
+    let zone = match cpu.current_vcpu.as_ref() {
+        Some(v) => v.zone.clone(),
+        None => return,
+    };
+    let current_vcpu_id = cpu.current_vcpu.as_ref().map(|v| v.id);
+    let zone_r = zone.read();
+
+    // Collect targets first (under read lock), then deliver (lock-free).
+    let targets: alloc::vec::Vec<_> = if irm == 1 {
+        zone_r.vcpus()
+            .iter()
+            .filter(|(id, _)| Some(**id) != current_vcpu_id)
+            .map(|(_, v)| v.clone())
+            .collect()
     } else {
-        trace!("send sgi {:#x?}", sgi_id);
-        write_sysreg!(icc_sgi1r_el1, val);
+        let mut v = alloc::vec::Vec::new();
+        for aff0 in 0..16u64 {
+            if (target_list & (1 << aff0)) == 0 { continue; }
+            let mpidr = GuestMpidr::new((aff3 << 32) | (aff2 << 16) | (aff1 << 8) | aff0);
+            if let Some(vcpu) = zone_r.get_vcpu_by_guest_mpidr(mpidr) {
+                v.push(vcpu);
+            }
+        }
+        v
+    };
+    drop(zone_r);
+
+    for vcpu in &targets {
+        deliver_sgi_to_vcpu(vcpu, sgi_id, cpu);
+    }
+}
+
+fn deliver_sgi_to_vcpu(vcpu: &alloc::sync::Arc<crate::vcpu::VCpu>, sgi_id: usize, cpu: &mut crate::cpu_data::PerCpu) {
+    use crate::vcpu::VCpuState;
+    use crate::cpu_data::PendingWake;
+
+    // Target is the currently running vCPU on this pCPU — inject directly.
+    if let Some(ref cur) = cpu.current_vcpu {
+        if cur.id == vcpu.id && vcpu.state() == VCpuState::Running {
+            crate::device::irqchip::inject_irq(sgi_id, false);
+            return;
+        }
     }
 
-    arch_skip_instruction(regs); //skip sgi write
+    match vcpu.state() {
+        VCpuState::Blocked => {
+            let target_pcpu  = vcpu.get_pcpu_affinity();
+            let current_pcpu = cpu.id;
+            if target_pcpu == current_pcpu {
+                vcpu.push_pending_irq(sgi_id, false);
+                match vcpu.transition(VCpuState::Blocked, VCpuState::Ready) {
+                    Ok(()) => {
+                        cpu.scheduler.remove_blocked(vcpu.id);
+                        cpu.scheduler.enqueue(vcpu.clone());
+                    }
+                    Err(()) => { /* already Ready/Running — resched is sufficient */ }
+                }
+                cpu.need_resched.store(true, core::sync::atomic::Ordering::Release);
+            } else {
+                // Cross-pCPU: push to target's pending_wake_ids, send IPI_EVENT_RESCHED.
+                // The target pCPU's handler injects the IRQ and enqueues the vCPU.
+                crate::cpu_data::get_cpu_data(target_pcpu)
+                    .pending_wake_ids.lock()
+                    .push_back(PendingWake { vcpu_id: vcpu.id, irq_id: sgi_id, is_hardware: false });
+                crate::event::send_event(target_pcpu, crate::hypercall::SGI_IPI_ID as _, crate::event::IPI_EVENT_RESCHED);
+            }
+        }
+        VCpuState::Ready => {
+            // Already in runqueue — IRQ will be drained on next switch-in.
+            vcpu.push_pending_irq(sgi_id, false);
+            cpu.need_resched.store(true, core::sync::atomic::Ordering::Release);
+        }
+        VCpuState::Running => {
+            // Running on another pCPU — send IPI_EVENT_RESCHED so the target pCPU
+            // sets need_resched and drains pending_virqs on its next EL2 exit.
+            let target_pcpu = vcpu.get_pcpu_affinity();
+            vcpu.push_pending_irq(sgi_id, false);
+            let target_cpu_data = crate::cpu_data::get_cpu_data(target_pcpu);
+            target_cpu_data.need_resched.store(true, core::sync::atomic::Ordering::Release);
+            crate::event::send_event(
+                target_pcpu,
+                crate::hypercall::SGI_IPI_ID as _,
+                crate::event::IPI_EVENT_RESCHED,
+            );
+        }
+        VCpuState::Stopped => {}
+    }
 }
 
 fn handle_hvc(regs: &mut GeneralRegisters) {
@@ -345,24 +479,62 @@ fn psci_emulate_features_info(code: u64) -> u64 {
 }
 
 fn psci_emulate_cpu_on(regs: &mut GeneralRegisters) -> u64 {
-    // Todo: Check if `cpu` is in the cpuset of current zone
-    let cpu = mpidr_to_cpuid(regs.usr[1]);
-    info!("psci: try to wake up cpu {}", cpu);
+    // regs.usr[1] = target MPIDR (guest-visible virtual, NOT physical)
+    // regs.usr[2] = entry_point_address
+    // regs.usr[3] = context_id (passed to secondary in x0)
+    let target_guest_mpidr = GuestMpidr::new(regs.usr[1]);
+    let entry_point = regs.usr[2] as usize;
+    let context_id  = regs.usr[3];
+    info!(
+        "psci CPU_ON: guest_mpidr={:#x} entry={:#x} ctx={:#x}",
+        target_guest_mpidr.0, entry_point, context_id
+    );
 
-    let target_data = get_cpu_data(cpu as _);
-    let _lock = target_data.ctrl_lock.lock();
-
-    if !target_data.arch_cpu.power_on {
-        target_data.cpu_on_entry = regs.usr[2] as _;
-        target_data.arch_cpu.power_on = true;
-        send_event(cpu as _, SGI_IPI_ID as _, IPI_EVENT_WAKEUP);
-    } else {
-        error!("psci: cpu {} already on", cpu);
-        return u64::MAX - 3;
+    // Look up target vCPU by guest MPIDR in the current zone.
+    // MUST use guest MPIDR lookup — mpidr_to_cpuid() resolves physical MPIDRs,
+    // which are unrelated to the zone-local virtual MPIDR guest passes here.
+    let zone = this_zone();
+    let vcpu = match zone.read().get_vcpu_by_guest_mpidr(target_guest_mpidr) {
+        Some(v) => v,
+        None => {
+            error!(
+                "psci CPU_ON: no vCPU for guest MPIDR {:#x}",
+                target_guest_mpidr.0
+            );
+            return u64::MAX; // PSCI_INVALID_PARAMETERS
+        }
     };
-    drop(_lock);
 
-    0
+    if vcpu.state() != VCpuState::Stopped {
+        error!(
+            "psci CPU_ON: vcpu {} not Stopped (state={:?})",
+            vcpu.id, vcpu.state()
+        );
+        return u64::MAX - 3; // PSCI_ALREADY_ON
+    }
+
+    // Reset vCPU arch state to ARMv8 reset values for a clean secondary boot.
+    vcpu.arch.reset_el1_regs();
+    vcpu.arch.reset_gic_state();
+
+    // Set entry point (ELR_EL2) and context_id (x0) in the vCPU's saved state.
+    // These will be restored by el1_regs.restore_to_hardware() on first switch-in.
+    unsafe {
+        let el1 = &mut *(core::ptr::addr_of!(vcpu.arch.el1_regs)
+            as *mut crate::arch::vcpu::El1SysRegs);
+        el1.elr_el2  = entry_point as u64;
+        el1.spsr_el2 = 0x3c5; // EL1h, D/A/I/F all masked
+    }
+    unsafe {
+        let gr = &mut *(core::ptr::addr_of!(vcpu.arch.guest_regs)
+            as *mut crate::arch::cpu::GeneralRegisters);
+        gr.usr.fill(0);
+        gr.usr[0] = context_id; // x0 = context_id (PSCI spec §5.4.2)
+    }
+
+    // Transition Stopped→Ready and deliver to its affinity pCPU.
+    let ret = crate::arch::vcpu::arch_wakeup_vcpu(vcpu);
+    if ret == 0 { 0 } else { u64::MAX - 3 }
 }
 
 fn handle_psci_smc(
@@ -375,15 +547,45 @@ fn handle_psci_smc(
     match code {
         PsciFnId::PSCI_VERSION => PSCI_VERSION_1_1,
         PsciFnId::PSCI_CPU_SUSPEND_32 | PsciFnId::PSCI_CPU_SUSPEND_64 => {
-            wfi();
-            gic_handle_irq();
+            // Block the current vCPU: transition Running→Blocked, then schedule().
+            // The scheduler will save context and pick the next Ready vCPU (or idle).
+            // When the vCPU is woken (timer expiry / SGI), schedule() will resume it
+            // and el1_regs.restore_to_hardware() will restore ELR_EL2/SPSR_EL2
+            // so guest resumes after the SMC instruction (arch_skip_instruction
+            // has already advanced ELR_EL2 past the SMC by the time we get here).
+            let cpu = this_cpu_data();
+            if let Some(ref vcpu) = cpu.current_vcpu.clone() {
+                let _ = vcpu.transition(VCpuState::Running, VCpuState::Blocked);
+                cpu.need_resched.store(true, core::sync::atomic::Ordering::Release);
+            }
+            // Return 0 (PSCI_SUCCESS) — guest will see this in x0 when woken.
             0
         }
         PsciFnId::PSCI_CPU_OFF_32 | PsciFnId::PSCI_CPU_OFF_64 => {
-            todo!();
+            // Stop the current vCPU permanently: transition Running→Stopped, then schedule().
+            // The scheduler will not re-enqueue it. Guest can re-start it via PSCI CPU_ON.
+            let cpu = this_cpu_data();
+            if let Some(ref vcpu) = cpu.current_vcpu.clone() {
+                let _ = vcpu.transition(VCpuState::Running, VCpuState::Stopped);
+                cpu.need_resched.store(true, core::sync::atomic::Ordering::Release);
+            }
+            // CPU_OFF never returns to the caller — need_resched will trigger
+            // schedule() at the end of arch_handle_exit and pick another vCPU.
+            0
         }
         PsciFnId::PSCI_AFFINITY_INFO_32 | PsciFnId::PSCI_AFFINITY_INFO_64 => {
-            !get_cpu_data(arg0 as _).arch_cpu.power_on as _
+            // arg0 = target affinity (guest MPIDR), arg1 = lowest_affinity_level
+            // Return 0 = ON, 1 = OFF, 2 = ON_PENDING
+            let target_guest_mpidr = GuestMpidr::new(arg0);
+            let zone = this_zone();
+            let vcpu_opt = zone.read().get_vcpu_by_guest_mpidr(target_guest_mpidr);
+            match vcpu_opt {
+                Some(vcpu) => match vcpu.state() {
+                    VCpuState::Running | VCpuState::Ready | VCpuState::Blocked => 0, // ON
+                    VCpuState::Stopped => 1, // OFF
+                },
+                None => 1, // unknown MPIDR → treat as OFF
+            }
         }
         PsciFnId::PSCI_MIG_INFO_TYPE => PSCI_TOS_NOT_PRESENT_MP,
         PsciFnId::PSCI_FEATURES => psci_emulate_features_info(regs.usr[1]),
