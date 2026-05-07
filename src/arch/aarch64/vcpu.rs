@@ -14,22 +14,21 @@
 // Authors:
 //
 
-//! AArch64 vCPU architecture state: EL1 system registers + GIC virtualization state.
+//! AArch64 vCPU architecture state: per-vCPU TrapFrame + EL1 system registers + GIC state.
 //!
 //! Each VCpu has an `ArchVCpu` that holds:
-//! - `guest_regs`: the general-purpose register frame (same layout as pCPU stack frame,
-//!   compatible with `vmreturn`). Saved/restored on every context switch.
+//! - `stack`: a private 128 KiB stack with a `TrapFrame` at the top.
+//!   trap.S saves guest x0..x30 + ELR_EL2 + SPSR_EL2 to pCPU stack on each exit;
+//!   arch_handle_exit() copies them into the vCPU's TrapFrame immediately.
+//!   vmreturn(trapframe_ptr) restores from TrapFrame and erets.
 //! - `el1_regs`: all EL1 system registers (SCTLR, TTBR, TCR, timer regs, etc.)
 //! - `gic_state`: GIC virtualization registers (ICH_LR*, ICH_VMCR, etc.)
-//!
-//! The `guest_regs` layout matches `GeneralRegisters` in `cpu.rs`:
-//!   [exit_reason: u64][x1..x30: u64; 30]  — total 256 bytes
-//! This allows `vmreturn(vcpu.arch.guest_regs_ptr())` to restore guest state correctly.
 
-use crate::arch::cpu::GeneralRegisters;
 use crate::arch::sysreg::{read_sysreg, write_sysreg};
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::cell::UnsafeCell;
+use crate::consts::VCPU_STACK_SIZE;
 
 // ========================
 // EL1 System Registers
@@ -69,9 +68,6 @@ pub struct El1SysRegs {
     pub cntv_ctl_el0: u64,
     pub cntv_cval_el0: u64,
     pub cntkctl_el1: u64,
-    // ELR_EL2 and SPSR_EL2 for this vCPU (guest PC + PSTATE)
-    pub elr_el2: u64,
-    pub spsr_el2: u64,
 }
 
 impl Default for El1SysRegs {
@@ -113,8 +109,6 @@ impl El1SysRegs {
             cntv_ctl_el0: 0,
             cntv_cval_el0: 0,
             cntkctl_el1: 0,
-            elr_el2: 0,
-            spsr_el2: 0x3c5, // EL1h, interrupts masked
         }
     }
 
@@ -148,9 +142,6 @@ impl El1SysRegs {
         self.cntv_ctl_el0   = read_sysreg!(CNTV_CTL_EL0);
         self.cntv_cval_el0  = read_sysreg!(CNTV_CVAL_EL0);
         self.cntkctl_el1    = read_sysreg!(CNTKCTL_EL1);
-        // Save guest PC and PSTATE from ELR_EL2/SPSR_EL2
-        self.elr_el2        = read_sysreg!(ELR_EL2);
-        self.spsr_el2       = read_sysreg!(SPSR_EL2);
     }
 
     /// Restore all EL1 system registers from this struct to hardware.
@@ -182,9 +173,11 @@ impl El1SysRegs {
         write_sysreg!(CNTP_CVAL_EL0,  self.cntp_cval_el0);
         write_sysreg!(CNTV_CVAL_EL0,  self.cntv_cval_el0);
         // Restore virtual timer control.
-        // If timer already expired (ISTATUS=1), mask it so check_blocked_timers
-        // handles wake-up via the software pending path rather than flooding IRQ 27.
-        let cntv_ctl     = self.cntv_ctl_el0;
+        // If already expired (ISTATUS=1), mask hardware delivery (IMASK=1) to prevent
+        // an immediate IRQ 27 flood on restore. IRQ 27 will be injected via the
+        // software path: sched_tick_handler Step 3 (running vCPU) or
+        // check_blocked_timers (blocked vCPU).
+        let cntv_ctl = self.cntv_ctl_el0;
         let timer_enabled = (cntv_ctl & 1) != 0;
         let timer_expired = (cntv_ctl & 4) != 0; // ISTATUS
         if timer_enabled && timer_expired {
@@ -194,9 +187,6 @@ impl El1SysRegs {
         }
         write_sysreg!(CNTKCTL_EL1, self.cntkctl_el1);
         write_sysreg!(PMCR_EL0, 0);
-        // Restore guest PC and PSTATE
-        write_sysreg!(ELR_EL2,  self.elr_el2);
-        write_sysreg!(SPSR_EL2, self.spsr_el2);
     }
 }
 
@@ -374,21 +364,66 @@ pub fn detect_gic_pri_bits() -> usize {
 // ArchVCpu
 // ========================
 
+// ========================
+// Per-vCPU stack
+// ========================
+
+#[repr(C, align(4096))]
+struct VCpuStack {
+    _st: [u8; VCPU_STACK_SIZE],
+}
+
+impl VCpuStack {
+    fn new_boxed() -> Box<Self> {
+        unsafe {
+            let layout = alloc::alloc::Layout::new::<Self>();
+            let ptr = alloc::alloc::alloc_zeroed(layout) as *mut Self;
+            if ptr.is_null() {
+                alloc::alloc::handle_alloc_error(layout);
+            }
+            Box::from_raw(ptr)
+        }
+    }
+
+    fn upper_bound(&self) -> *const u8 {
+        unsafe { (self._st.as_ptr()).add(VCPU_STACK_SIZE) }
+    }
+}
+
+// ========================
+// TrapFrame
+// ========================
+
+/// Per-vCPU guest register frame, lives at the top of the vCPU's private stack.
+///
+/// Layout (matches trap.S save/restore order):
+///   offset 0x000: x[0..30]  — x0..x30  (31 × u64)
+///   offset 0x0f8: elr        — ELR_EL2  (guest PC)
+///   offset 0x100: spsr       — SPSR_EL2 (guest PSTATE)
+///   offset 0x108: _pad       — padding to reach 272 bytes (16-byte aligned)
+/// Total: 34 × 8 = 272 bytes. SP must be 16-byte aligned on AArch64.
+#[repr(C)]
+#[derive(Default)]
+pub struct TrapFrame {
+    pub x: [u64; 31],   // x0..x30
+    pub elr: u64,       // ELR_EL2: guest PC at trap
+    pub spsr: u64,      // SPSR_EL2: guest PSTATE at trap
+    _pad: u64,          // padding: sizeof(TrapFrame) = 272 = 16×17 (SP alignment)
+}
+
+// ========================
+// ArchVCpu
+// ========================
+
 /// Per-VCpu architecture state for AArch64.
 ///
-/// `guest_regs` uses the same layout as the pCPU stack frame saved by trap.S:
-///   offset 0: exit_reason (u64, zeroed on vcpu_switch_in)
-///   offset 8: x1..x30 (u64; 30)
-/// Total: 32 × 8 = 256 bytes.
-///
-/// On vcpu_switch_out: the registers currently on the pCPU stack (at `stack_top - 256`)
-/// are copied into `guest_regs`.
-/// On vcpu_switch_in: `guest_regs` is copied back to the pCPU stack, then
-/// `vmreturn(stack_frame_ptr)` is called.
+/// Each vCPU has its own private stack (`stack`) with a `TrapFrame` at the top.
+/// `vmreturn(trapframe_ptr)` restores x0..x30, ELR_EL2, SPSR_EL2 and erets to guest.
+/// Context switches operate directly on the trapframe — no memcpy to/from pCPU stack.
 #[repr(C)]
 pub struct ArchVCpu {
-    /// Saved guest general-purpose registers. Same layout as `GeneralRegisters`.
-    pub guest_regs: GeneralRegisters,
+    /// Private stack for this vCPU. TrapFrame lives at stack top.
+    stack: Box<VCpuStack>,
     /// Saved EL1 system registers (SCTLR, TTBR, TCR, timer, etc.) + ELR/SPSR.
     pub el1_regs: El1SysRegs,
     /// Saved GIC virtualization state (ICH_LR*, ICH_VMCR, vGICR shadow).
@@ -399,10 +434,23 @@ impl ArchVCpu {
     pub fn new() -> Self {
         let lr_count = safe_detect_gic_lr_count();
         Self {
-            guest_regs: GeneralRegisters { exit_reason: 0, usr: [0; 31] },
-            el1_regs:   El1SysRegs::reset(),
-            gic_state:  GicState::new_with_lr_count(lr_count),
+            stack:     VCpuStack::new_boxed(),
+            el1_regs:  El1SysRegs::reset(),
+            gic_state: GicState::new_with_lr_count(lr_count),
         }
+    }
+
+    /// Returns a mutable reference to the TrapFrame at the top of this vCPU's stack.
+    pub fn trapframe(&self) -> &mut TrapFrame {
+        unsafe {
+            let ptr = self.stack.upper_bound() as usize - core::mem::size_of::<TrapFrame>();
+            &mut *(ptr as *mut TrapFrame)
+        }
+    }
+
+    /// Returns the raw pointer to the TrapFrame, suitable for passing to `vmreturn`.
+    pub fn trapframe_ptr(&self) -> usize {
+        self.stack.upper_bound() as usize - core::mem::size_of::<TrapFrame>()
     }
 
     /// Reset EL1 regs to ARMv8 architectural reset values (for PSCI CPU_ON hotplug).
@@ -424,11 +472,6 @@ impl ArchVCpu {
                 GicState::new_with_lr_count(safe_detect_gic_lr_count()),
             );
         }
-    }
-
-    /// Returns a raw pointer to `guest_regs`, suitable for passing to `vmreturn`.
-    pub fn guest_regs_ptr(&self) -> usize {
-        core::ptr::addr_of!(self.guest_regs) as usize
     }
 }
 

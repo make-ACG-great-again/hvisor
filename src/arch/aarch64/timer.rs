@@ -133,7 +133,16 @@ pub fn sched_tick_handler() {
     // Step 2: Check ready VCPUs' virtual timers (1:N overcommit)
     cpu.scheduler.check_ready_timers(current_cnt);
 
-    // Step 3: Check hardware CNTV_CTL_EL0 ISTATUS for current running VCPU
+    // Step 3: Check the currently running vCPU's hardware CNTV ISTATUS.
+    //
+    // When restore_to_hardware sets IMASK=1 on an already-expired CNTV, the physical
+    // IRQ 27 signal is suppressed. The running vCPU will never receive IRQ 27 via the
+    // hardware EL1-IRQ path. We must inject it here via the software LR path.
+    //
+    // The LR HW=0 vs physical IRQ 27 conflict is handled by inject_irq: if a HW=0
+    // LR entry for IRQ 27 already exists when the physical IRQ 27 arrives (because
+    // IMASK was cleared by guest before we got here), gicv3_handle_irq_el1 will
+    // write DIR to clear the physical Active state (see the LR conflict fix there).
     {
         let cntv_ctl: u64 = read_sysreg!(CNTV_CTL_EL0);
         let timer_enabled = (cntv_ctl & 1) != 0;

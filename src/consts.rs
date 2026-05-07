@@ -33,6 +33,9 @@ pub const HV_HEAP_SIZE: usize = 1024 * 1024; // 1 MiB
 /// Size of the hypervisor memory pool used for dynamic allocation.
 pub const HV_MEM_POOL_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
 
+/// Size of each vCPU's private stack (used for per-vCPU trapframe).
+pub const VCPU_STACK_SIZE: usize = 128 * 1024; // 128 KiB
+
 /// Size of the per-CPU data area, including stack and CPU-local data.
 ///
 /// This area is allocated for each CPU core and may increase in size during

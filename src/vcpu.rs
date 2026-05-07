@@ -205,9 +205,12 @@ impl VCpu {
     /// Drops oldest entry if queue is full.
     pub fn push_pending_irq(&self, irq_id: usize, is_hardware: bool) {
         let mut queue = self.pending_virqs.lock();
-        // Deduplicate SGIs (0-15) and virtual timer (27).
-        if irq_id < 16 || irq_id == 27 {
-            if let Some(pos) = queue.iter().position(|p| p.irq_id == irq_id) {
+        // Deduplicate virtual timer (27) only — it is level-triggered so multiple
+        // pending copies are redundant. SGIs must NOT be deduplicated: each SGI
+        // represents an independent IPI (e.g., TLB shootdown), and dropping one
+        // can cause memory consistency failures in the guest.
+        if irq_id == 27 {
+            if let Some(pos) = queue.iter().position(|p| p.irq_id == 27) {
                 queue[pos] = PendingIrq { irq_id, is_hardware };
                 return;
             }

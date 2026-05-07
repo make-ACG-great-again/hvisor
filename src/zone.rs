@@ -578,16 +578,14 @@ pub fn zone_create(config: &HvZoneConfig) -> HvResult<Arc<Zone>> {
             if local_idx == 0 {
                 // Set guest entry point (ELR_EL2) and initial x0 = dtb_ipa (Linux convention).
                 info!("boot vcpu={} entry_point={:#x} dtb_ipa={:#x}", vcpu.id, config.entry_point, dtb_ipa);
-                unsafe {
-                    let regs = core::ptr::addr_of!(vcpu.arch.el1_regs) as *mut crate::arch::vcpu::El1SysRegs;
-                    (*regs).elr_el2 = config.entry_point;
-                    info!("el1_regs.elr_el2 after write = {:#x}", (*regs).elr_el2);
-                    info!("el1_regs.spsr_el2 after write = {:#x}", (*regs).spsr_el2);
-                    // vmreturn layout: ldp x1,x0,[sp],#16 — first pair is (exit_reason, usr[0]).
-                    // exit_reason → hardware x1 (discarded), usr[0] → hardware x0.
-                    // So Linux x0 (dtb address) maps to guest_regs.usr[0].
-                    let guest = core::ptr::addr_of!(vcpu.arch.guest_regs) as *mut crate::arch::cpu::GeneralRegisters;
-                    (*guest).usr[0] = dtb_ipa as u64;
+                {
+                    // Set entry point and dtb in the boot vCPU's TrapFrame.
+                    let tf = vcpu.arch.trapframe();
+                    tf.x.fill(0);
+                    tf.x[0] = dtb_ipa as u64;       // x0 = DTB IPA
+                    tf.elr  = config.entry_point as u64;
+                    tf.spsr = 0x3c5;                 // EL1h, D/A/I/F masked
+                    info!("boot vcpu trapframe: elr={:#x} spsr={:#x} x0={:#x}", tf.elr, tf.spsr, tf.x[0]);
                 }
                 let _ = vcpu.transition(VCpuState::Stopped, VCpuState::Ready);
                 let cpu_data = get_cpu_data(cpuid);
