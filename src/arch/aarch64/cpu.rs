@@ -15,17 +15,17 @@
 //
 use crate::{
     arch::{mm::new_s2_memory_set, sysreg::write_sysreg},
-    consts::{MAX_CPU_NUM, PAGE_SIZE, PER_CPU_ARRAY_PTR, PER_CPU_SIZE},
+    consts::{MAX_CPU_NUM, PAGE_SIZE},
     cpu_data::this_cpu_data,
     memory::{
         addr::PHYS_VIRT_OFFSET, mm::PARKING_MEMORY_SET, GuestPhysAddr, HostPhysAddr, MemFlags,
-        MemoryRegion, VirtAddr, PARKING_INST_PAGE,
+        MemoryRegion, PARKING_INST_PAGE,
     },
     platform::BOARD_MPIDR_MAPPINGS,
     zone::find_zone,
 };
 use aarch64_cpu::registers::{
-    Readable, Writeable, ELR_EL2, HCR_EL2, MPIDR_EL1, SCTLR_EL1, SPSR_EL2, VTCR_EL2,
+    Readable, Writeable, HCR_EL2, MPIDR_EL1, SCTLR_EL1, SPSR_EL2, VTCR_EL2,
 };
 use core::ptr::addr_of;
 
@@ -82,23 +82,22 @@ impl ArchCpu {
         }
     }
 
+    /// Reset the current vCPU's TrapFrame and EL1 system registers for a clean boot.
+    /// `entry` = guest entry PC, `dtb` = DTB IPA passed in x0.
     pub fn reset(&mut self, entry: usize, dtb: usize) {
         debug!(
             "cpu {} reset, entry: {:#x}, dtb: {:#x}",
             self.cpuid, entry, dtb
         );
-        ELR_EL2.set(entry as _);
-        SPSR_EL2.write(
-            SPSR_EL2::D::SET
-                + SPSR_EL2::A::SET
-                + SPSR_EL2::I::SET
-                + SPSR_EL2::F::SET
-                + SPSR_EL2::M::EL1h,
-        );
-
-        let regs = self.guest_reg();
-        regs.clear();
-        regs.usr[0] = dtb as _; // dtb addr
+        // Write entry/dtb into the current vCPU's TrapFrame.
+        // vmreturn() will restore elr → ELR_EL2 and spsr → SPSR_EL2 on eret.
+        if let Some(ref vcpu) = this_cpu_data().current_vcpu {
+            let tf = vcpu.arch.trapframe();
+            tf.x.fill(0);
+            tf.x[0]  = dtb as u64;  // x0 = DTB IPA
+            tf.elr   = entry as u64;
+            tf.spsr  = 0x3c5;       // EL1h, D/A/I/F masked
+        }
         self.reset_vm_regs();
         self.activate_vmm();
     }
@@ -127,14 +126,11 @@ impl ArchCpu {
                 + HCR_EL2::IMO::SET
                 + HCR_EL2::FMO::SET,
         );
-    }
-
-    fn stack_top(&self) -> VirtAddr {
-        PER_CPU_ARRAY_PTR as VirtAddr + (self.cpuid + 1) as usize * PER_CPU_SIZE
-    }
-
-    fn guest_reg(&self) -> &mut GeneralRegisters {
-        unsafe { &mut *((self.stack_top() - 32 * 8) as *mut GeneralRegisters) }
+        // TWI (bit 13): trap WFI from EL1 to EL2 for vCPU scheduling.
+        // The aarch64-cpu crate doesn't expose TWI, so set it via raw RMW.
+        let mut hcr = HCR_EL2.get();
+        hcr |= 1 << 13;
+        HCR_EL2.set(hcr);
     }
 
     fn reset_vm_regs(&self) {
@@ -204,9 +200,8 @@ impl ArchCpu {
             self.cpuid,
             this_cpu_data().cpu_on_entry
         );
-        unsafe {
-            vmreturn(self.guest_reg() as *mut _ as usize);
-        }
+        let trapframe_ptr = this_cpu_data().current_vcpu.as_ref().unwrap().arch.trapframe_ptr();
+        unsafe { vmreturn(trapframe_ptr) }
     }
 
     pub fn idle(&mut self) -> ! {
@@ -240,7 +235,8 @@ impl ArchCpu {
         unsafe {
             PARKING_MEMORY_SET.get().unwrap().activate();
             info!("cpu {} start parking", self.cpuid);
-            vmreturn(self.guest_reg() as *mut _ as usize);
+            let trapframe_ptr = this_cpu_data().current_vcpu.as_ref().unwrap().arch.trapframe_ptr();
+            vmreturn(trapframe_ptr);
         }
     }
 }

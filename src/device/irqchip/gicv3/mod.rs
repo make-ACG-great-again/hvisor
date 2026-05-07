@@ -137,13 +137,65 @@ pub fn gicv3_handle_irq_el1() {
             } else {
                 warn!("not konw irq id = {}", irq_id);
             }
-            if irq_id != 25 {
-                inject_irq(irq_id, true);
-            }
+            // Snapshot LR state before inject_irq modifies it.
+            // We need to detect the HW=0 conflict case: a software-injected LR.HW=0
+            // entry already exists for this irq_id when a physical (HW=1) IRQ arrives.
+            // In that case the physical IRQ stays Active after EOIR (EOImode=1), because
+            // we relied on LR.HW=1 + guest EOI to deactivate it — but the LR is HW=0.
+            // We must write DIR after EOIR (EOIR must precede DIR per GICv3 spec).
+            let hw0_conflict = if is_hardware_irq(irq_id) {
+                find_lr_hw0(irq_id)
+            } else {
+                false
+            };
+
+            let lr_written = if irq_id != 25 {
+                inject_irq(irq_id, true)
+            } else {
+                true
+            };
+            // EOIR first (priority drop), then DIR (deactivate) — order required by spec.
             deactivate_irq(irq_id);
+            // Write DIR when physical Active state won't be cleared by guest EOI:
+            // 1. lr_written=false: LR not written (all full), physical stays Active.
+            // 2. hw0_conflict: LR has HW=0 entry, guest EOI won't deactivate physical.
+            // In both cases: EOIR already done above, now safe to DIR.
+            if irq_id == 27 && !lr_written {
+                write_sysreg!(icc_dir_el1, 27u64);
+            }
+            if hw0_conflict {
+                write_sysreg!(icc_dir_el1, irq_id as u64);
+                warn!("irq {} LR HW=0 conflict: wrote DIR after EOIR", irq_id);
+            }
         }
     }
     trace!("handle done")
+}
+
+/// Returns true if irq_id is a hardware-mapped IRQ (PPI or SPI, not SGI).
+/// SGIs (0-15) are always software-only; PPIs (16-31) and SPIs (32+) are hardware.
+fn is_hardware_irq(irq_id: usize) -> bool {
+    irq_id >= 16
+}
+
+/// Returns true if any LR holds irq_id as a software-only (HW=0) entry.
+/// Used to detect the conflict where a physical IRQ arrives while a HW=0 LR
+/// entry already exists — guest EOI won't deactivate the physical Active state.
+fn find_lr_hw0(irq_id: usize) -> bool {
+    const LR_VIRTIRQ_MASK: usize = (1 << 32) - 1;
+    let vtr = read_sysreg!(ich_vtr_el2) as usize;
+    let lr_num = (vtr & 0xf) + 1;
+    let elsr: u64 = read_sysreg!(ich_elrsr_el2);
+    for i in 0..lr_num {
+        if (elsr >> i) & 1 == 1 {
+            continue; // LR is free/empty
+        }
+        let lr_val = read_lr(i) as usize;
+        if (lr_val & LR_VIRTIRQ_MASK) == irq_id && (lr_val & (1 << 61)) == 0 {
+            return true; // found HW=0 entry for this irq_id
+        }
+    }
+    false
 }
 
 fn pending_irq() -> Option<usize> {
@@ -157,7 +209,10 @@ fn pending_irq() -> Option<usize> {
 
 fn deactivate_irq(irq_id: usize) {
     write_sysreg!(icc_eoir1_el1, irq_id as u64);
-    if irq_id < 16 || irq_id == 25 {
+    // With EOImode=1, EOIR only drops priority. DIR deactivates the interrupt.
+    // Must DIR for: SGIs (<16), maintenance (25), EL2 timer (26).
+    // IRQ 27 (CNTV) is injected with LR.HW=1; guest EOIR handles deactivation automatically.
+    if irq_id < 16 || irq_id == 25 || irq_id == 26 {
         write_sysreg!(icc_dir_el1, irq_id as u64);
     }
 }
@@ -471,6 +526,14 @@ pub fn primary_init_early() {
     }
 
     PENDING_VIRQS.call_once(|| PendingIrqs::new(MAX_CPU_NUM));
+
+    // Force CPU_GICR_BASE Lazy initialization here, while running single-threaded
+    // with IRQs disabled (primary_init_early runs before primary_init_late/enable_irqs).
+    // Without this, the first access to CPU_GICR_BASE happens in el2_timer_init on each
+    // pCPU concurrently with IRQs already enabled — if an IRQ fires during Lazy init and
+    // the handler also calls host_gicr_base(), the spin::Lazy spinlock deadlocks silently.
+    let _ = &*CPU_GICR_BASE;
+
     debug!("gic = {:#x?}", GIC.get().unwrap());
 }
 

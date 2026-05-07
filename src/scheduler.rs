@@ -275,19 +275,12 @@ impl PerCpuScheduler {
 // ========================
 
 /// Save outgoing VCpu's full context.
-/// Saves EL1 system registers + GIC virtualization state.
+/// General registers are already in the vCPU's TrapFrame (saved by trap.S on entry).
+/// Here we only save EL1 system registers + GIC virtualization state.
 #[cfg(target_arch = "aarch64")]
-pub fn vcpu_switch_out(vcpu: &VCpu, stack_regs_ptr: usize) {
+pub fn vcpu_switch_out(vcpu: &VCpu) {
     // DSB ISH: ensure all guest EL1 stores are visible before saving context.
     unsafe { core::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
-
-    // Copy current pCPU stack frame (guest general registers) into vcpu.arch.guest_regs.
-    // The stack frame is at `stack_regs_ptr` (= stack_top - 256), same layout as GeneralRegisters.
-    unsafe {
-        let src = stack_regs_ptr as *const crate::arch::cpu::GeneralRegisters;
-        let dst = core::ptr::addr_of!(vcpu.arch.guest_regs) as *mut crate::arch::cpu::GeneralRegisters;
-        dst.write_volatile(src.read_volatile());
-    }
 
     unsafe {
         let arch = &vcpu.arch as *const _ as *mut crate::arch::vcpu::ArchVCpu;
@@ -298,25 +291,15 @@ pub fn vcpu_switch_out(vcpu: &VCpu, stack_regs_ptr: usize) {
 
 /// Restore incoming VCpu's full context.
 /// Restores EL1 registers + GIC state + vGICR + VMPIDR_EL2 + pending IRQs.
-/// Also copies vcpu.arch.guest_regs (heap) to the pCPU stack frame at `stack_regs_ptr`
-/// so that `vmreturn(stack_regs_ptr)` restores EL2 SP to pCPU stack_top (not heap).
+/// General registers live in the vCPU's TrapFrame; vmreturn(trapframe_ptr) restores them.
 #[cfg(target_arch = "aarch64")]
-pub fn vcpu_switch_in(vcpu: &VCpu, prev_zone_id: Option<usize>, stack_regs_ptr: usize) {
+pub fn vcpu_switch_in(vcpu: &VCpu, prev_zone_id: Option<usize>) {
     use crate::arch::vcpu::restore_vgicr;
     use crate::arch::sysreg::write_sysreg;
 
-    // Restore EL1 system registers (also restores ELR_EL2 and SPSR_EL2)
+    // Restore EL1 system registers (does NOT restore ELR_EL2/SPSR_EL2 — those come from TrapFrame)
     vcpu.arch.el1_regs.restore_to_hardware();
     vcpu.arch.gic_state.restore_to_hardware();
-
-    // Copy vcpu's saved guest_regs (heap) to the pCPU stack frame.
-    // vmreturn(stack_regs_ptr) advances SP by 32*8 and erets, leaving
-    // SP_EL2 = stack_top — the correct pCPU stack top for the next trap.
-    unsafe {
-        let src = core::ptr::addr_of!(vcpu.arch.guest_regs) as *const crate::arch::cpu::GeneralRegisters;
-        let dst = stack_regs_ptr as *mut crate::arch::cpu::GeneralRegisters;
-        dst.write_volatile(src.read_volatile());
-    }
 
     // Restore per-VCpu virtual GICR shadow (IGROUPR0, ISENABLER0, IPRIORITYR, ICFGR1)
     restore_vgicr(vcpu);
@@ -361,23 +344,13 @@ pub fn vcpu_switch_in(vcpu: &VCpu, prev_zone_id: Option<usize>, stack_regs_ptr: 
 /// Core scheduling function.
 ///
 /// Called when `need_resched` is true or from IPI handlers.
-/// `stack_regs_ptr` is the current pCPU's guest register frame pointer
-/// (stack_top - 256), needed to save the outgoing VCpu's general registers.
-///
-/// After schedule() returns, the caller should call
-/// `vmreturn(current_vcpu.arch.guest_regs_ptr())` to enter the new VCpu.
+/// General registers are already in each vCPU's TrapFrame (saved by trap.S on entry).
+/// After schedule() returns, the caller calls `vmreturn(vcpu.arch.trapframe_ptr())`.
 #[cfg(target_arch = "aarch64")]
-pub fn schedule(stack_regs_ptr: usize) {
+pub fn schedule() {
     use crate::cpu_data::this_cpu_data;
     use crate::vcpu::drain_incoming_vcpus;
     use core::sync::atomic::Ordering;
-
-    // Mask all interrupts for the duration of schedule() + vcpu_switch_in().
-    // An EL2h IRQ between restore_to_hardware() (which writes SPSR_EL2 = guest PSTATE)
-    // and vmreturn()'s eret would overwrite SPSR_EL2 with EL2 context, causing eret
-    // to enter EL2 instead of EL1.  IRQs are re-enabled by eret via SPSR_EL2.DAIF,
-    // or explicitly before WFI in el2_idle_loop.
-    unsafe { core::arch::asm!("msr daifset, #0xf", options(nostack, preserves_flags)) };
 
     // Drain incoming VCPUs (PSCI CPU_ON cross-pCPU delivery) before picking.
     drain_incoming_vcpus();
@@ -393,6 +366,13 @@ pub fn schedule(stack_regs_ptr: usize) {
             crate::arch::timer::el2_timer_rearm();
             return;
         }
+        // Fast path missed — log why (trace only, warn was causing UART timing issues).
+        trace!("[SCH-SLOWPATH] pcpu={} vcpu={} state={:?} rq={} blocked={}",
+            cpu.id, current.id, current.state(),
+            cpu.scheduler.len(), cpu.scheduler.has_blocked_vcpus());
+    } else {
+        trace!("[SCH-SLOWPATH] pcpu={} no current vcpu rq={} blocked={}",
+            cpu.id, cpu.scheduler.len(), cpu.scheduler.has_blocked_vcpus());
     }
 
     let prev_vcpu = cpu.scheduler.current.take();
@@ -400,7 +380,7 @@ pub fn schedule(stack_regs_ptr: usize) {
 
     // Save outgoing VCpu
     if let Some(ref prev) = prev_vcpu {
-        vcpu_switch_out(prev, stack_regs_ptr);
+        vcpu_switch_out(prev);
         prev_zone_id = Some(prev.zone.id());
 
         let state = prev.state();
@@ -467,8 +447,7 @@ pub fn schedule(stack_regs_ptr: usize) {
             cpu.scheduler.time_slice_remaining = DEFAULT_TIME_SLICE;
             cpu.scheduler.current = Some(next_vcpu.clone());
 
-            // Restore incoming VCpu context (also copies guest_regs → pCPU stack frame)
-            vcpu_switch_in(&next_vcpu, prev_zone_id, stack_regs_ptr);
+            vcpu_switch_in(&next_vcpu, prev_zone_id);
 
             crate::arch::timer::el2_timer_rearm();
 

@@ -19,35 +19,52 @@
 	b	\label
 .endm
 
-.macro handle_vmexit exit_reason
+// handle_vmexit: save guest registers directly into the current vCPU's TrapFrame.
+//
+// SP is set to the TrapFrame address by vmreturn (mov sp, x0) before eret.
+// So when a trap fires, SP already points to the TrapFrame base.
+//
+// TrapFrame layout (SP = base):
+//   [sp+0x000] x0       (u64)
+//   [sp+0x008] x1       (u64)
+//   ...
+//   [sp+0x0f0] x30      (u64)
+//   [sp+0x0f8] elr_el2  (u64)
+//   [sp+0x100] spsr_el2 (u64)
+//
+// Calling convention to arch_handle_exit:
+//   x0 = sp  (pointer to TrapFrame = &mut TrapFrame)
+//   x1 = exit_reason
+.macro	handle_vmexit exit_reason
 	.align	7
-	/* Fill the union registers. Should comply with NUM_USR_REGS */
-	/*now sp =>per_cpu stack top*/
-	stp	x29, x30, [sp, #-16]!
-	stp	x27, x28, [sp, #-16]!
-	stp	x25, x26, [sp, #-16]!
-	stp	x23, x24, [sp, #-16]!
-	stp	x21, x22, [sp, #-16]!
-	stp	x19, x20, [sp, #-16]!
-	stp	x17, x18, [sp, #-16]!
-	stp	x15, x16, [sp, #-16]!
-	stp	x13, x14, [sp, #-16]!
-	stp	x11, x12, [sp, #-16]!
-	stp	x9, x10, [sp, #-16]!
-	stp	x7, x8, [sp, #-16]!
-	stp	x5, x6, [sp, #-16]!
-	stp	x3, x4, [sp, #-16]!
-	stp	x1, x2, [sp, #-16]!
-
+	stp	x0,  x1,  [sp]
+	stp	x2,  x3,  [sp, #0x10]
+	stp	x4,  x5,  [sp, #0x20]
+	stp	x6,  x7,  [sp, #0x30]
+	stp	x8,  x9,  [sp, #0x40]
+	stp	x10, x11, [sp, #0x50]
+	stp	x12, x13, [sp, #0x60]
+	stp	x14, x15, [sp, #0x70]
+	stp	x16, x17, [sp, #0x80]
+	stp	x18, x19, [sp, #0x90]
+	stp	x20, x21, [sp, #0xa0]
+	stp	x22, x23, [sp, #0xb0]
+	stp	x24, x25, [sp, #0xc0]
+	stp	x26, x27, [sp, #0xd0]
+	stp	x28, x29, [sp, #0xe0]
+	str	x30,      [sp, #0xf0]
+	mrs	x1, ELR_EL2
+	str	x1,       [sp, #0xf8]
+	mrs	x1, SPSR_EL2
+	str	x1,       [sp, #0x100]
+	mov	x0, sp
 	mov	x1, #\exit_reason
-	stp	x1, x0, [sp, #-16]!
-
-	mov	x29, xzr	/* reset fp,lr */
+	mov	x29, xzr
 	mov	x30, xzr
-	mov	x0, sp		/*x0 guest regs*/
 	bl	{0}
 	b	.
 .endm
+
 EXIT_REASON_EL2_ABORT	=0x0
 EXIT_REASON_EL2_IRQ		=0x1
 EXIT_REASON_EL1_ABORT	=0x2

@@ -16,7 +16,7 @@
 use aarch64_cpu::registers::*;
 use core::arch::global_asm;
 
-use super::cpu::GeneralRegisters;
+use crate::arch::vcpu::TrapFrame;
 use crate::arch::sysreg::smc_call;
 use crate::zone::zone_error;
 use crate::{
@@ -117,12 +117,17 @@ pub enum TrapReturn {
     TrapForbidden = -1,
 }
 
-/*From hyp_vec->handle_vmexit x0:guest regs x1:exit_reason sp =stack_top-32*8*/
-pub fn arch_handle_exit(regs: &mut GeneralRegisters) -> ! {
+/// EL2 trap entry point called from trap.S handle_vmexit.
+///
+/// trap.S writes guest registers directly into the vCPU TrapFrame (SP = TrapFrame base),
+/// then calls us with x0=&TrapFrame, x1=exit_reason.
+/// We dispatch the exit, then vmreturn from TrapFrame (which also resets SP=TrapFrame).
+pub fn arch_handle_exit(regs: &mut TrapFrame, exit_reason: u64) -> ! {
     let mpidr = MPIDR_EL1.get();
     let _cpu_id = mpidr_to_cpuid(mpidr);
-    trace!("cpu exit, exit_reson:{:#x?}", regs.exit_reason);
-    match regs.exit_reason as u64 {
+    trace!("cpu exit, exit_reason:{:#x?}", exit_reason);
+
+    match exit_reason {
         ExceptionType::EXIT_REASON_EL1_IRQ | ExceptionType::EXIT_REASON_EL1_AARCH32_IRQ => {
             irqchip_handle_irq1()
         }
@@ -141,22 +146,26 @@ pub fn arch_handle_exit(regs: &mut GeneralRegisters) -> ! {
             arch_handle_trap_el2(regs)
         }
         ExceptionType::EXIT_REASON_EL2_IRQ => irqchip_handle_irq2(),
-        _ => arch_dump_exit(regs.exit_reason),
+        _ => arch_dump_exit(exit_reason),
     }
 
-    // Check if a vCPU context switch is needed.
-    // `regs` points to the pCPU stack frame (stack_top - 256) — this is the
-    // "current guest register snapshot" that vcpu_switch_out will copy from.
-    let stack_regs_ptr = regs as *const _ as usize;
     let cpu = this_cpu_data();
     if cpu.need_resched.load(core::sync::atomic::Ordering::Acquire) {
-        crate::scheduler::schedule(stack_regs_ptr);
+        crate::scheduler::schedule();
     }
 
-    // schedule() → vcpu_switch_in() already copied the selected vCPU's guest_regs
-    // to the pCPU stack frame at stack_regs_ptr.  Always vmreturn from there so
-    // SP_EL2 ends up at stack_top after eret (not pointing into the vCPU heap).
-    unsafe { vmreturn(stack_regs_ptr) }
+    // Drain any pending_virqs for the current vCPU.
+    if let Some(ref vcpu) = this_cpu_data().current_vcpu {
+        let pending = vcpu.drain_pending_irqs();
+        for pirq in pending {
+            crate::device::irqchip::inject_irq(pirq.irq_id, pirq.is_hardware);
+        }
+    }
+
+    let trapframe_ptr = this_cpu_data()
+        .current_vcpu.as_ref().unwrap()
+        .arch.trapframe_ptr();
+    unsafe { vmreturn(trapframe_ptr) }
 }
 
 fn irqchip_handle_irq1() {
@@ -169,7 +178,7 @@ fn irqchip_handle_irq2() {
     loop {}
 }
 
-fn arch_handle_trap_el1(regs: &mut GeneralRegisters) {
+fn arch_handle_trap_el1(regs: &mut TrapFrame) {
     let mut _ret = TrapReturn::TrapUnhandled;
 
     trace!(
@@ -182,6 +191,7 @@ fn arch_handle_trap_el1(regs: &mut GeneralRegisters) {
         Some(ESR_EL2::EC::Value::HVC64) => handle_hvc(regs),
         Some(ESR_EL2::EC::Value::SMC64) => handle_smc(regs),
         Some(ESR_EL2::EC::Value::TrappedMsrMrs) => handle_sysreg(regs),
+        Some(ESR_EL2::EC::Value::TrappedWFIorWFE) => handle_wfi_trap(regs),
         Some(ESR_EL2::EC::Value::DataAbortLowerEL) => handle_dabt(regs),
         Some(ESR_EL2::EC::Value::InstrAbortLowerEL) => handle_iabt(regs),
         _ => {
@@ -196,7 +206,7 @@ fn arch_handle_trap_el1(regs: &mut GeneralRegisters) {
     }
 }
 
-fn arch_handle_trap_el2(_regs: &mut GeneralRegisters) {
+fn arch_handle_trap_el2(_regs: &mut TrapFrame) {
     let elr = ELR_EL2.get();
     let esr = ESR_EL2.get();
     let far = FAR_EL2.get();
@@ -235,7 +245,7 @@ fn arch_dump_el2_state() {
     println!("  ESR_EL2={:#x} FAR_EL2={:#x} HPFAR_EL2={:#x}", read_sysreg!(ESR_EL2), read_sysreg!(FAR_EL2), read_sysreg!(HPFAR_EL2));
 }
 
-fn handle_iabt(_regs: &mut GeneralRegisters) {
+fn handle_iabt(_regs: &mut TrapFrame) {
     let iss = ESR_EL2.read(ESR_EL2::ISS);
     let op = iss >> 6 & 0x1;
     let hpfar = read_sysreg!(HPFAR_EL2);
@@ -252,7 +262,91 @@ fn handle_iabt(_regs: &mut GeneralRegisters) {
     // arch_skip_instruction(frame);
 }
 
-fn handle_dabt(regs: &mut GeneralRegisters) {
+fn handle_wfi_trap(regs: &mut TrapFrame) {
+    use crate::arch::sysreg::read_sysreg;
+    use crate::vcpu::VCpuState;
+
+    let iss = ESR_EL2.read(ESR_EL2::ISS);
+    let is_wfe = (iss & 1) != 0;
+
+    // WFE: just skip, no yield.
+    if is_wfe {
+        arch_skip_instruction(regs);
+        return;
+    }
+
+    let cpu = this_cpu_data();
+    let vcpu = match cpu.current_vcpu.as_ref() {
+        Some(v) => v.clone(),
+        None => { arch_skip_instruction(regs); return; }
+    };
+
+    // If pending IRQs already exist, WFI condition is satisfied — just skip.
+    if vcpu.has_pending_irqs() {
+        arch_skip_instruction(regs);
+        return;
+    }
+
+    // If any GIC LR is pending (not all free), skip WFI so guest can handle it.
+    let elrsr = read_sysreg!(ICH_ELRSR_EL2);
+    let vtr   = read_sysreg!(ICH_VTR_EL2);
+    let lr_count = ((vtr & 0xf) + 1) as u64;
+    let all_empty_mask = (1u64 << lr_count) - 1;
+    if (elrsr & all_empty_mask) != all_empty_mask {
+        arch_skip_instruction(regs);
+        return;
+    }
+
+    let has_blocked = cpu.scheduler.has_blocked_vcpus();
+    let rq_empty    = cpu.scheduler.is_empty();
+    let truly_alone = cpu.scheduler.no_other_vcpus();
+
+    let vcpu_id = vcpu.id;
+    let pcpu_id = cpu.id;
+
+    let cntv_ctl: u64 = read_sysreg!(CNTV_CTL_EL0);
+    let timer_already_expired = (cntv_ctl & 0x5) == 0x5; // ENABLE=1, ISTATUS=1
+
+    if truly_alone && timer_already_expired {
+        // Timer already fired — skip WFI immediately and return to guest.
+        // sched_tick_handler Step 3 will inject IRQ 27 on the next EL2 tick (≤10ms).
+        // Do NOT inject_irq(27, false) here: it creates a HW=0 LR that conflicts
+        // with the physical IRQ 27 delivery (HW=1), causing Active state leaks.
+        drop(vcpu);
+        arch_skip_instruction(regs);
+    } else if truly_alone {
+        // Timer not yet expired — real EL2 WFI until next physical IRQ.
+        drop(vcpu);
+        crate::arch::timer::el2_timer_rearm();
+        unsafe { core::arch::asm!("msr daifclr, #0xf") };
+        aarch64_cpu::asm::wfi();
+        unsafe { core::arch::asm!("msr daifset, #0xf") };
+        crate::vcpu::drain_incoming_vcpus();
+        if !cpu.scheduler.is_empty() {
+            cpu.need_resched.store(true, core::sync::atomic::Ordering::Release);
+        }
+        arch_skip_instruction(regs);
+    } else if rq_empty && has_blocked {
+        // Blocked vCPUs exist but runqueue is empty. Do NOT block self — deadlock.
+        // Do real EL2 WFI so pCPU stays responsive. Advance PC first.
+        arch_skip_instruction(regs);
+        drop(vcpu);
+        crate::arch::timer::el2_timer_rearm();
+        unsafe { core::arch::asm!("msr daifclr, #0xf") };
+        aarch64_cpu::asm::wfi();
+        unsafe { core::arch::asm!("msr daifset, #0xf") };
+        crate::vcpu::drain_incoming_vcpus();
+        cpu.need_resched.store(true, core::sync::atomic::Ordering::Release);
+    } else {
+        // Other Ready vCPUs exist — block current vCPU and yield pCPU.
+        trace!("[WFI] vcpu={} pcpu={} → block + resched", vcpu_id, pcpu_id);
+        let _ = vcpu.transition(VCpuState::Running, VCpuState::Blocked);
+        arch_skip_instruction(regs);
+        cpu.need_resched.store(true, core::sync::atomic::Ordering::Release);
+    }
+}
+
+fn handle_dabt(regs: &mut TrapFrame) {
     let iss = ESR_EL2.read(ESR_EL2::ISS);
     let is_write = (iss >> 6 & 0x1) != 0;
     let srt = iss >> 16 & 0x1f;
@@ -269,7 +363,7 @@ fn handle_dabt(regs: &mut GeneralRegisters) {
         size,
         is_write,
         value: if is_write && srt != 31 {
-            regs.usr[srt as usize] as _
+            regs.x[srt as usize] as _
         } else {
             0
         },
@@ -284,7 +378,7 @@ fn handle_dabt(regs: &mut GeneralRegisters) {
                     mmio_access.value =
                         ((mmio_access.value << (32 - 8 * size)) as i32) as usize >> (32 - 8 * size);
                 }
-                regs.usr[srt as usize] = mmio_access.value as _;
+                regs.x[srt as usize] = mmio_access.value as _;
             }
         }
         Err(e) => {
@@ -296,10 +390,10 @@ fn handle_dabt(regs: &mut GeneralRegisters) {
     arch_skip_instruction(regs);
 }
 
-fn handle_sysreg(regs: &mut GeneralRegisters) {
+fn handle_sysreg(regs: &mut TrapFrame) {
     trace!("esr_el2: iss {:#x?}", ESR_EL2.read(ESR_EL2::ISS));
     let rt = (ESR_EL2.get() >> 5) & 0x1f;
-    let val = regs.usr[rt as usize];
+    let val = regs.x[rt as usize];
     let sgi_id = ((val >> 24) & 0xf) as usize;
     handle_guest_sgi(val, sgi_id);
     arch_skip_instruction(regs);
@@ -408,13 +502,13 @@ fn deliver_sgi_to_vcpu(vcpu: &alloc::sync::Arc<crate::vcpu::VCpu>, sgi_id: usize
     }
 }
 
-fn handle_hvc(regs: &mut GeneralRegisters) {
+fn handle_hvc(regs: &mut TrapFrame) {
     /*
     if ESR_EL2.read(ESR_EL2::ISS) != 0x4a48 {
         return;
     }
     */
-    let (code, arg0, arg1) = (regs.usr[0], regs.usr[1], regs.usr[2]);
+    let (code, arg0, arg1) = (regs.x[0], regs.x[1], regs.x[2]);
     let cpu_data = this_cpu_data();
 
     trace!(
@@ -432,11 +526,11 @@ fn handle_hvc(regs: &mut GeneralRegisters) {
         }
     };
     debug!("HVC result = {}", result);
-    regs.usr[0] = result as _;
+    regs.x[0] = result as _;
 }
 
-fn handle_smc(regs: &mut GeneralRegisters) {
-    let (code, arg0, arg1, arg2) = (regs.usr[0], regs.usr[1], regs.usr[2], regs.usr[3]);
+fn handle_smc(regs: &mut TrapFrame) {
+    let (code, arg0, arg1, arg2) = (regs.x[0], regs.x[1], regs.x[2], regs.x[3]);
     //info!(
     //    "SMC from CPU{}, func_id:{:#x?}, arg0:{:#x?}, arg1:{:#x?}, arg2:{:#x?}",
     //    cpu_data.id, code, arg0, arg1, arg2
@@ -445,11 +539,11 @@ fn handle_smc(regs: &mut GeneralRegisters) {
         SmcType::ARCH_SC => handle_arch_smc(regs, code, arg0, arg1, arg2),
         SmcType::STANDARD_SC => handle_psci_smc(regs, code, arg0, arg1, arg2),
         SmcType::TOS_SC_START..=SmcType::TOS_SC_END | SmcType::SIP_SC => {
-            let ret = smc_call(code, &regs.usr[1..18]);
-            regs.usr[0] = ret[0];
-            regs.usr[1] = ret[1];
-            regs.usr[2] = ret[2];
-            regs.usr[3] = ret[3];
+            let ret = smc_call(code, &regs.x[1..18]);
+            regs.x[0] = ret[0];
+            regs.x[1] = ret[1];
+            regs.x[2] = ret[2];
+            regs.x[3] = ret[3];
             ret[0]
         }
         _ => {
@@ -457,7 +551,7 @@ fn handle_smc(regs: &mut GeneralRegisters) {
             0
         }
     };
-    regs.usr[0] = result;
+    regs.x[0] = result;
 
     arch_skip_instruction(regs); //skip the smc ins
 }
@@ -478,13 +572,13 @@ fn psci_emulate_features_info(code: u64) -> u64 {
     }
 }
 
-fn psci_emulate_cpu_on(regs: &mut GeneralRegisters) -> u64 {
-    // regs.usr[1] = target MPIDR (guest-visible virtual, NOT physical)
-    // regs.usr[2] = entry_point_address
-    // regs.usr[3] = context_id (passed to secondary in x0)
-    let target_guest_mpidr = GuestMpidr::new(regs.usr[1]);
-    let entry_point = regs.usr[2] as usize;
-    let context_id  = regs.usr[3];
+fn psci_emulate_cpu_on(regs: &mut TrapFrame) -> u64 {
+    // regs.x[1] = target MPIDR (guest-visible virtual, NOT physical)
+    // regs.x[2] = entry_point_address
+    // regs.x[3] = context_id (passed to secondary in x0)
+    let target_guest_mpidr = GuestMpidr::new(regs.x[1]);
+    let entry_point = regs.x[2] as usize;
+    let context_id  = regs.x[3];
     info!(
         "psci CPU_ON: guest_mpidr={:#x} entry={:#x} ctx={:#x}",
         target_guest_mpidr.0, entry_point, context_id
@@ -517,19 +611,14 @@ fn psci_emulate_cpu_on(regs: &mut GeneralRegisters) -> u64 {
     vcpu.arch.reset_el1_regs();
     vcpu.arch.reset_gic_state();
 
-    // Set entry point (ELR_EL2) and context_id (x0) in the vCPU's saved state.
-    // These will be restored by el1_regs.restore_to_hardware() on first switch-in.
-    unsafe {
-        let el1 = &mut *(core::ptr::addr_of!(vcpu.arch.el1_regs)
-            as *mut crate::arch::vcpu::El1SysRegs);
-        el1.elr_el2  = entry_point as u64;
-        el1.spsr_el2 = 0x3c5; // EL1h, D/A/I/F all masked
-    }
-    unsafe {
-        let gr = &mut *(core::ptr::addr_of!(vcpu.arch.guest_regs)
-            as *mut crate::arch::cpu::GeneralRegisters);
-        gr.usr.fill(0);
-        gr.usr[0] = context_id; // x0 = context_id (PSCI spec §5.4.2)
+    // Set entry point and context_id in the vCPU's TrapFrame.
+    // vcpu_switch_in will load ELR_EL2/SPSR_EL2 from trapframe on first schedule-in.
+    {
+        let tf = vcpu.arch.trapframe();
+        tf.x.fill(0);
+        tf.x[0] = context_id;          // x0 = context_id (PSCI spec §5.4.2)
+        tf.elr  = entry_point as u64;  // guest entry PC
+        tf.spsr = 0x3c5;               // EL1h, D/A/I/F all masked
     }
 
     // Transition Stopped→Ready and deliver to its affinity pCPU.
@@ -538,7 +627,7 @@ fn psci_emulate_cpu_on(regs: &mut GeneralRegisters) -> u64 {
 }
 
 fn handle_psci_smc(
-    regs: &mut GeneralRegisters,
+    regs: &mut TrapFrame,
     code: u64,
     arg0: u64,
     _arg1: u64,
@@ -588,7 +677,7 @@ fn handle_psci_smc(
             }
         }
         PsciFnId::PSCI_MIG_INFO_TYPE => PSCI_TOS_NOT_PRESENT_MP,
-        PsciFnId::PSCI_FEATURES => psci_emulate_features_info(regs.usr[1]),
+        PsciFnId::PSCI_FEATURES => psci_emulate_features_info(regs.x[1]),
         PsciFnId::PSCI_CPU_ON_32 | PsciFnId::PSCI_CPU_ON_64 => psci_emulate_cpu_on(regs),
         PsciFnId::PSCI_SYSTEM_OFF => {
             let zone = this_zone();
@@ -621,7 +710,7 @@ fn handle_psci_smc(
 }
 
 fn handle_arch_smc(
-    _regs: &mut GeneralRegisters,
+    _regs: &mut TrapFrame,
     code: u64,
     _arg0: u64,
     _arg1: u64,
@@ -637,18 +726,13 @@ fn handle_arch_smc(
     }
 }
 
-fn arch_skip_instruction(_regs: &mut GeneralRegisters) {
-    //ELR_EL2: ret address
-    let mut pc = ELR_EL2.get();
-    //ESR_EL2::IL exception instruction length
+fn arch_skip_instruction(regs: &mut TrapFrame) {
     let ins = match ESR_EL2.read(ESR_EL2::IL) {
-        0 => 2, //16 bit ins
-        1 => 4, //32 bit ins
+        0 => 2, // 16-bit Thumb instruction
+        1 => 4, // 32-bit AArch64 instruction
         _ => 0,
     };
-    //skip ins
-    pc = pc + ins;
-    ELR_EL2.set(pc);
+    regs.elr += ins;
 }
 
 fn arch_dump_exit(reason: u64) {
@@ -659,31 +743,41 @@ fn arch_dump_exit(reason: u64) {
 
 #[naked]
 #[no_mangle]
-pub unsafe extern "C" fn vmreturn(_gu_regs: usize) -> ! {
+/// Restore guest context from a TrapFrame and eret to guest.
+///
+/// x0 = pointer to TrapFrame. We set SP = x0 so that the next trap
+/// writes directly into this TrapFrame (SP stays = TrapFrame base).
+///
+/// TrapFrame layout:
+///   [+0x000] x0..x30  (31 × u64, 248 bytes)
+///   [+0x0f8] elr       (u64) — loaded into ELR_EL2
+///   [+0x100] spsr      (u64) — loaded into SPSR_EL2
+pub unsafe extern "C" fn vmreturn(trapframe: usize) -> ! {
     core::arch::asm!(
         "
-        /* x0: guest registers */
-        mov	sp, x0
-        ldp	x1, x0, [sp], #16	/* x1 is the exit_reason */
-        ldp	x1, x2, [sp], #16
-        ldp	x3, x4, [sp], #16
-        ldp	x5, x6, [sp], #16
-        ldp	x7, x8, [sp], #16
-        ldp	x9, x10, [sp], #16
-        ldp	x11, x12, [sp], #16
-        ldp	x13, x14, [sp], #16
-        ldp	x15, x16, [sp], #16
-        ldp	x17, x18, [sp], #16
-        ldp	x19, x20, [sp], #16
-        ldp	x21, x22, [sp], #16
-        ldp	x23, x24, [sp], #16
-        ldp	x25, x26, [sp], #16
-        ldp	x27, x28, [sp], #16
-        ldp	x29, x30, [sp], #16
-        /*now el2 sp point to per cpu stack top*/
-        eret                            //ret to el2_entry hvc #0 now,depend on ELR_EL2
-        
-    ",
+        mov  sp, x0
+        ldp  x2,  x3,  [sp, #0x10]
+        ldp  x4,  x5,  [sp, #0x20]
+        ldp  x6,  x7,  [sp, #0x30]
+        ldp  x8,  x9,  [sp, #0x40]
+        ldp  x10, x11, [sp, #0x50]
+        ldp  x12, x13, [sp, #0x60]
+        ldp  x14, x15, [sp, #0x70]
+        ldp  x16, x17, [sp, #0x80]
+        ldp  x18, x19, [sp, #0x90]
+        ldp  x20, x21, [sp, #0xa0]
+        ldp  x22, x23, [sp, #0xb0]
+        ldp  x24, x25, [sp, #0xc0]
+        ldp  x26, x27, [sp, #0xd0]
+        ldp  x28, x29, [sp, #0xe0]
+        ldr  x30,      [sp, #0xf0]
+        ldr  x1,       [sp, #0xf8]
+        msr  elr_el2,  x1
+        ldr  x1,       [sp, #0x100]
+        msr  spsr_el2, x1
+        ldp  x0,  x1,  [sp]
+        eret
+        ",
         options(noreturn),
     )
 }

@@ -122,22 +122,16 @@ impl PerCpu {
             self.arch_cpu.power_on = true;
             self.need_resched.store(true, core::sync::atomic::Ordering::Release);
 
-            // Build a minimal "idle" GeneralRegisters on the stack to satisfy
-            // vcpu_switch_out's stack_regs_ptr on the very first schedule() call.
-            // vcpu_switch_out copies this into the outgoing vCPU's guest_regs,
-            // but since current_vcpu is None on first entry, switch_out is skipped.
-            // We still need a valid pointer — use the pCPU stack frame location.
             use crate::arch::aarch64::trap::vmreturn;
-            use crate::consts::{PER_CPU_ARRAY_PTR, PER_CPU_SIZE};
-            use crate::memory::addr::VirtAddr;
-            let stack_top = PER_CPU_ARRAY_PTR as VirtAddr + (self.id + 1) * PER_CPU_SIZE;
-            let stack_regs_ptr = stack_top - 32 * 8;
             loop {
-                crate::scheduler::schedule(stack_regs_ptr);
-                // schedule() → vcpu_switch_in() copied guest_regs → pCPU stack frame.
-                // vmreturn(stack_regs_ptr) loads regs from there and eret, leaving
-                // SP_EL2 = stack_top (correct for the next trap's handle_vmexit push).
-                unsafe { vmreturn(stack_regs_ptr) }
+                crate::scheduler::schedule();
+                // schedule() → vcpu_switch_in() restored EL1 regs + GIC state.
+                // vmreturn(trapframe_ptr) restores x0..x30 + ELR/SPSR from the
+                // vCPU's private TrapFrame and erets to guest.
+                let trapframe_ptr = self.current_vcpu.as_ref()
+                    .expect("schedule() returned with no current_vcpu")
+                    .arch.trapframe_ptr();
+                unsafe { vmreturn(trapframe_ptr) }
             }
         }
         #[cfg(not(target_arch = "aarch64"))]
