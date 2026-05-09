@@ -155,6 +155,10 @@ pub struct ZoneInner {
     /// Mapping from guest-visible MPIDR to global vcpu_id.
     /// Used by PSCI CPU_ON to find the target vCPU.
     guest_mpidr_to_vcpu: BTreeMap<GuestMpidr, usize>,
+    /// SPI IRQ → target vcpu_id mapping, set by guest writes to GICD_IROUTER.
+    /// Used by schedule_inject_irq() to route SPIs to the correct vCPU.
+    /// Heap-allocated to avoid stack overflow (1024 entries).
+    pub irq_target_vcpu: alloc::boxed::Box<[Option<usize>; 1024]>,
 }
 
 impl Zone {
@@ -222,6 +226,7 @@ impl ZoneInner {
             vcpu_base: usize::MAX,
             vcpus: BTreeMap::new(),
             guest_mpidr_to_vcpu: BTreeMap::new(),
+            irq_target_vcpu: alloc::boxed::Box::new([None; 1024]),
         }
     }
 
@@ -333,6 +338,20 @@ impl ZoneInner {
         &self.vcpus
     }
 
+    pub fn vcpus_mut(&mut self) -> &mut BTreeMap<usize, Arc<crate::vcpu::VCpu>> {
+        &mut self.vcpus
+    }
+
+    /// Look up a vCPU by global vcpu_id.
+    pub fn get_vcpu(&self, vcpu_id: usize) -> Option<Arc<crate::vcpu::VCpu>> {
+        self.vcpus.get(&vcpu_id).cloned()
+    }
+
+    /// Number of vCPUs in this zone.
+    pub fn vcpu_count(&self) -> usize {
+        self.vcpus.len()
+    }
+
     /// Look up a vCPU by guest-visible MPIDR. Used by PSCI CPU_ON.
     pub fn get_vcpu_by_guest_mpidr(&self, mpidr: GuestMpidr) -> Option<Arc<crate::vcpu::VCpu>> {
         let vcpu_id = *self.guest_mpidr_to_vcpu.get(&mpidr)?;
@@ -441,7 +460,9 @@ pub fn zone_create(config: &HvZoneConfig) -> HvResult<Arc<Zone>> {
 
     let mut zone = Zone::new(zone_id, &config.name);
     zone.pt_init(config.memory_regions())?;
-    zone.mmio_init(&config.arch_config);
+    // NOTE: mmio_init (specifically vgicv3_mmio_init for GICR regions) must run
+    // AFTER vcpu creation so that vcpu_base and vcpu_count() are valid.
+    // It is called on new_zone_pointer below, after the vcpu block.
 
     #[cfg(feature = "pci")]
     {
@@ -544,16 +565,26 @@ pub fn zone_create(config: &HvZoneConfig) -> HvResult<Arc<Zone>> {
         });
     }
 
-    // Create one vCPU per pCPU in cpu_set, set affinity, register guest MPIDR mapping,
-    // and enqueue each vCPU onto its affinity pCPU's scheduler.
+    // Create vCPUs and bind them to pCPUs via round-robin affinity.
+    // num_vcpus() controls total vCPU count; pCPUs in cpu_set are assigned in round-robin.
+    // For 1:1 (default): num_vcpus() == cpu_set.len(), each pCPU gets exactly one vCPU.
+    // For 1:N overcommit: num_vcpus() > cpu_set.len(), pCPUs share vCPUs round-robin.
     #[cfg(target_arch = "aarch64")]
     {
         use crate::vcpu::{VCpu, VCpuState};
 
-        let mut vcpu_base = usize::MAX;
-        let mut local_idx: u64 = 0;
+        let pcpu_list: Vec<usize> = cpu_set.iter().collect();
+        let num_pcpus = pcpu_list.len();
+        let total_vcpus = config.num_vcpus();
 
-        for cpuid in cpu_set.iter() {
+        assert!(num_pcpus > 0, "zone {} has empty cpu_set", zone_id);
+
+        let mut vcpu_base = usize::MAX;
+
+        for local_idx in 0..total_vcpus {
+            // Round-robin: vCPU i binds to pcpu_list[i % num_pcpus]
+            let cpuid = pcpu_list[local_idx % num_pcpus];
+
             let vcpu = Arc::new(VCpu::new(new_zone_pointer.clone()));
 
             // Record the first vCPU id as vcpu_base
@@ -564,7 +595,7 @@ pub fn zone_create(config: &HvZoneConfig) -> HvResult<Arc<Zone>> {
             vcpu.set_pcpu_affinity(cpuid);
 
             // Guest MPIDR for this vCPU: zone-local index in Aff0 field
-            let guest_mpidr = GuestMpidr::new(local_idx);
+            let guest_mpidr = GuestMpidr::new(local_idx as u64);
 
             // Register in zone's vCPU map
             {
@@ -573,38 +604,43 @@ pub fn zone_create(config: &HvZoneConfig) -> HvResult<Arc<Zone>> {
                 inner.guest_mpidr_to_vcpu.insert(guest_mpidr, vcpu.id);
             }
 
+            info!(
+                "zone {}: vcpu={} local_idx={} -> pcpu={} guest_mpidr={:#x}",
+                zone_id, vcpu.id, local_idx, cpuid, local_idx
+            );
+
             // Boot vCPU (local_idx == 0) starts in Ready state immediately.
-            // Secondary vCPUs start Stopped; PSCI CPU_ON will wake them.
+            // Secondary vCPUs start Stopped; PSCI CPU_ON will transition them to Ready.
             if local_idx == 0 {
-                // Set guest entry point (ELR_EL2) and initial x0 = dtb_ipa (Linux convention).
                 info!("boot vcpu={} entry_point={:#x} dtb_ipa={:#x}", vcpu.id, config.entry_point, dtb_ipa);
                 {
-                    // Set entry point and dtb in the boot vCPU's TrapFrame.
                     let tf = vcpu.arch.trapframe();
                     tf.x.fill(0);
-                    tf.x[0] = dtb_ipa as u64;       // x0 = DTB IPA
+                    tf.x[0] = dtb_ipa as u64;
                     tf.elr  = config.entry_point as u64;
-                    tf.spsr = 0x3c5;                 // EL1h, D/A/I/F masked
+                    tf.spsr = 0x3c5; // EL1h, D/A/I/F masked
                     info!("boot vcpu trapframe: elr={:#x} spsr={:#x} x0={:#x}", tf.elr, tf.spsr, tf.x[0]);
                 }
                 let _ = vcpu.transition(VCpuState::Stopped, VCpuState::Ready);
-                let cpu_data = get_cpu_data(cpuid);
-                cpu_data.scheduler.enqueue(vcpu.clone());
+                if zone_id == 0 {
+                    get_cpu_data(cpuid).scheduler.enqueue(vcpu.clone());
+                }
             }
-
-            local_idx += 1;
+            // local_idx > 0: Stopped, waiting for PSCI CPU_ON from guest.
         }
 
         // Store vcpu_base in zone
         new_zone_pointer.write().vcpu_base = vcpu_base;
 
         info!(
-            "zone {}: created {} vCPU(s), vcpu_base={}",
-            zone_id,
-            local_idx,
-            vcpu_base
+            "zone {}: created {} vCPU(s) on {} pCPU(s) (round-robin), vcpu_base={}",
+            zone_id, total_vcpus, num_pcpus, vcpu_base
         );
     }
+
+    // Initialize MMIO regions (including GICR per-vCPU regions) now that
+    // vcpu_base and vcpu_count() are valid.
+    new_zone_pointer.mmio_init(&config.arch_config);
 
     Ok(new_zone_pointer)
 }

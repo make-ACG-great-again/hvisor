@@ -11,15 +11,15 @@
 		#size-cells = <0x00>;
 		#address-cells = <0x01>;
 
-		cpu@2 {
-			reg = <0x02>;
+		cpu@0 {
+			reg = <0x00>;
 			enable-method = "psci";
 			compatible = "arm,cortex-a72";
 			device_type = "cpu";
 		};
 
-		cpu@3 {
-			reg = <0x03>;
+		cpu@1 {
+			reg = <0x01>;
 			enable-method = "psci";
 			compatible = "arm,cortex-a72";
 			device_type = "cpu";

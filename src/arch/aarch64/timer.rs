@@ -125,9 +125,18 @@ pub fn sched_tick_handler() {
     let current_cnt = read_sysreg!(CNTPCT_EL0);
 
     // Step 1: Check blocked VCPUs' virtual timers
+    let blocked_before = cpu.scheduler.blocked_vcpu_count();
     let woken = cpu.scheduler.check_blocked_timers(current_cnt);
     if woken > 0 {
         cpu.need_resched.store(true, Ordering::Release);
+        trace!("[TICK] pcpu={} woke {} blocked vcpus (was {})", cpu.id, woken, blocked_before);
+    } else if blocked_before > 0 {
+        // Blocked vCPUs exist but none woken — log first entry for diagnosis
+        if let Some((cval, ctl, cntvoff, blocked_at)) = cpu.scheduler.first_blocked_timer_info() {
+            let virtual_cnt = current_cnt.wrapping_sub(cntvoff);
+            trace!("[TICK] pcpu={} {} blocked vcpu(s) not woken: cval={:#x} virt_cnt={:#x} ctl={:#x} blocked_at={:#x} now={:#x}",
+                cpu.id, blocked_before, cval, virtual_cnt, ctl, blocked_at, current_cnt);
+        }
     }
 
     // Step 2: Check ready VCPUs' virtual timers (1:N overcommit)
@@ -137,18 +146,26 @@ pub fn sched_tick_handler() {
     //
     // When restore_to_hardware sets IMASK=1 on an already-expired CNTV, the physical
     // IRQ 27 signal is suppressed. The running vCPU will never receive IRQ 27 via the
-    // hardware EL1-IRQ path. We must inject it here via the software LR path.
+    // hardware EL1-IRQ path. We must inject it here via the software (HW=0) LR path.
     //
-    // The LR HW=0 vs physical IRQ 27 conflict is handled by inject_irq: if a HW=0
-    // LR entry for IRQ 27 already exists when the physical IRQ 27 arrives (because
-    // IMASK was cleared by guest before we got here), gicv3_handle_irq_el1 will
-    // write DIR to clear the physical Active state (see the LR conflict fix there).
+    // IMPORTANT: only inject when IMASK=1. If IMASK=0, the physical IRQ 27 is already
+    // unmasked and will arrive via the normal EL1-IRQ path as HW=1. Injecting HW=0
+    // on top of a pending HW=1 creates a conflict: guest EOI clears the virtual side
+    // but leaves the physical Active state set, causing an IRQ 27 storm.
     {
         let cntv_ctl: u64 = read_sysreg!(CNTV_CTL_EL0);
         let timer_enabled = (cntv_ctl & 1) != 0;
+        let timer_masked  = (cntv_ctl & 2) != 0; // IMASK: set by restore_to_hardware
         let timer_expired = (cntv_ctl & 4) != 0; // ISTATUS bit
-        if timer_enabled && timer_expired && cpu.scheduler.current.is_some() {
-            crate::device::irqchip::inject_irq(27, false);
+        // Only proxy IRQ 27 when IMASK=1 suppresses the physical delivery.
+        // Push to pending_virqs rather than calling inject_irq() directly:
+        // vcpu_vmreturn() is the single inject point and also sets IMASK=1 before
+        // writing the HW=0 LR, preventing the physical IRQ 27 from re-firing
+        // before the guest consumes the LR (which caused the Pending-conflict warns).
+        if timer_enabled && timer_masked && timer_expired {
+            if let Some(ref vcpu) = cpu.scheduler.current {
+                vcpu.push_pending_irq(27, false);
+            }
         }
     }
 

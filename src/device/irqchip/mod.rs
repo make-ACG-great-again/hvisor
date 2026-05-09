@@ -30,6 +30,7 @@ pub mod gicv3;
 #[cfg(all(feature = "gicv3", target_arch = "aarch64"))]
 pub use gicv3::{
     gicd::set_ispender, inject_irq, percpu_init, primary_init_early, primary_init_late,
+    schedule_inject_irq,
 };
 
 #[cfg(target_arch = "aarch64")]
@@ -84,7 +85,7 @@ impl Zone {
         }
     }
 
-    pub fn mmio_init(&mut self, hv_config: &HvArchZoneConfig) {
+    pub fn mmio_init(&self, hv_config: &HvArchZoneConfig) {
         #[cfg(all(feature = "gicv2", target_arch = "aarch64"))]
         {
             self.vgicv2_mmio_init(hv_config);

@@ -31,9 +31,11 @@ pub const IPI_EVENT_SHUTDOWN: usize = 1;
 pub const IPI_EVENT_VIRTIO_INJECT_IRQ: usize = 2;
 pub const IPI_EVENT_WAKEUP_VIRTIO_DEVICE: usize = 3;
 /// Tell target pCPU to call drain_pending_wake_ids() + schedule().
-pub const IPI_EVENT_RESCHED: usize = 10;
+pub const IPI_EVENT_RESCHED: usize = 7;
 /// New vCPU arrived in incoming_vcpus queue; drain and schedule.
-pub const IPI_EVENT_INCOMING_VCPU: usize = 11;
+pub const IPI_EVENT_INCOMING_VCPU: usize = 8;
+/// Zone is being destroyed: pCPU must clear its scheduler and re-enter idle loop.
+pub const IPI_EVENT_ZONE_SHUTDOWN: usize = 9;
 
 #[percpu::def_percpu]
 static PERCPU_EVENTS: Mutex<VecDeque<usize>> = Mutex::new(VecDeque::new());
@@ -106,6 +108,15 @@ pub fn check_events() -> bool {
         Some(IPI_EVENT_WAKEUP_VIRTIO_DEVICE) => {
             inject_irq(IRQ_WAKEUP_VIRTIO_DEVICE, false);
             true
+        }
+        Some(IPI_EVENT_ZONE_SHUTDOWN) => {
+            // Zone is being destroyed. Clear all vCPUs from this pCPU's scheduler
+            // (safe here — we are in EL2, guest is not running).
+            // idle() sets power_on=false and re-enters the scheduler loop.
+            info!("[SHUTDOWN] pcpu{} received IPI_EVENT_ZONE_SHUTDOWN, calling clear_all+idle", cpu_data.id);
+            cpu_data.scheduler.clear_all();
+            cpu_data.current_vcpu = None;
+            cpu_data.arch_cpu.idle();
         }
         Some(IPI_EVENT_RESCHED) => {
             crate::vcpu::drain_pending_wake_ids();

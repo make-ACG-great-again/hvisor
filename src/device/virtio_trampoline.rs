@@ -27,9 +27,13 @@ use crate::{
     hypercall::SGI_IPI_ID,
 };
 use crate::{
-    arch::cpu::this_cpu_id, consts::MAX_WAIT_TIMES, device::irqchip::inject_irq, error::HvResult,
+    arch::cpu::this_cpu_id, consts::MAX_WAIT_TIMES, error::HvResult,
     memory::MMIOAccess, zone::this_zone_id,
 };
+#[cfg(all(feature = "gicv3", target_arch = "aarch64"))]
+use crate::device::irqchip::schedule_inject_irq;
+#[cfg(not(all(feature = "gicv3", target_arch = "aarch64")))]
+use crate::device::irqchip::inject_irq;
 use alloc::collections::BTreeMap;
 use core::{
     fmt::{Debug, Formatter, Result},
@@ -160,6 +164,13 @@ pub fn handle_virtio_irq() {
     let irq_list = map.get_mut(&this_cpu_id()).unwrap();
     let len = irq_list[0] as usize;
     for irq_id in irq_list[1..=len].iter() {
+        // Use schedule_inject_irq for SPIs (>= 32) so the IRQ is pushed to the
+        // target vCPU's pending queue and the vCPU is woken if Blocked.
+        // inject_irq only writes an LR directly, which silently drops the IRQ
+        // when the target vCPU is not currently running (e.g. waiting for I/O).
+        #[cfg(all(feature = "gicv3", target_arch = "aarch64"))]
+        schedule_inject_irq(*irq_id as _, false);
+        #[cfg(not(all(feature = "gicv3", target_arch = "aarch64")))]
         inject_irq(*irq_id as _, false);
     }
     irq_list[0] = 0;

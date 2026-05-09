@@ -171,6 +171,13 @@ impl HvZoneConfig {
         v
     }
 
+    /// Return the number of vCPUs to create for this zone.
+    /// TEST (2:4 overcommit): 2 pCPUs each host 2 vCPUs = 4 vCPUs total.
+    /// Revert to `self.cpus().len()` for normal 1:1 operation.
+    pub fn num_vcpus(&self) -> usize {
+        self.cpus().len() * 2
+    }
+
     pub fn ivc_config(&self) -> &[HvIvcConfig] {
         &self.ivc_configs[..self.num_ivc_configs as usize]
     }
