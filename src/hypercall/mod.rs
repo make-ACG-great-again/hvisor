@@ -27,7 +27,7 @@ use crate::zone::{
     add_zone, all_zones_info, find_zone, is_this_root_zone, remove_zone, zone_create, ZoneInfo,
 };
 
-use crate::event::{send_event, IPI_EVENT_SHUTDOWN, IPI_EVENT_VIRTIO_INJECT_IRQ, IPI_EVENT_WAKEUP};
+use crate::event::{send_event, IPI_EVENT_RESCHED, IPI_EVENT_SHUTDOWN, IPI_EVENT_VIRTIO_INJECT_IRQ, IPI_EVENT_ZONE_SHUTDOWN};
 use core::convert::TryFrom;
 use numeric_enum_macro::numeric_enum;
 
@@ -199,18 +199,33 @@ impl<'a> HyperCall<'a> {
         let boot_cpu = zone.read().cpu_set().first_cpu().unwrap();
 
         let target_data = get_cpu_data(boot_cpu as _);
-        let _lock = target_data.ctrl_lock.lock();
 
-        if !target_data.arch_cpu.power_on {
-            info!("boot_cpu: {}", boot_cpu);
-            send_event(boot_cpu, SGI_IPI_ID as _, IPI_EVENT_WAKEUP);
-        } else {
-            error!("hv_zone_start: cpu {} already on", boot_cpu);
-            return hv_result_err!(EBUSY);
-        };
+        // Register zone in global list BEFORE enqueuing the boot vCPU.
         self.check_cpu_id();
-        add_zone(zone);
-        drop(_lock);
+        add_zone(zone.clone());
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+
+        // Mark all pCPUs in this zone as power_on=true so that hv_zone_shutdown's
+        // wait loop can correctly detect when they have finished shutting down
+        // (IPI_EVENT_ZONE_SHUTDOWN handler sets power_on=false).
+        zone.read().cpu_set().iter().for_each(|cpu_id| {
+            get_cpu_data(cpu_id).arch_cpu.power_on = true;
+        });
+
+        // Enqueue boot vCPU. Hold ctrl_lock only for the enqueue itself, then
+        // release BEFORE send_event: holding ctrl_lock across an SGI can deadlock
+        // if the target pCPU's IPI handler also tries to acquire ctrl_lock.
+        let vcpu_base = zone.vcpu_base();
+        let boot_vcpu = zone.read().vcpus().get(&vcpu_base).cloned()
+            .expect("hv_zone_start: boot vcpu not found");
+        {
+            let _lock = target_data.ctrl_lock.lock();
+            target_data.scheduler.enqueue(boot_vcpu);
+            target_data.need_resched.store(true, core::sync::atomic::Ordering::Release);
+        }
+        info!("boot_cpu: {}, enqueue vcpu={} then resched IPI", boot_cpu, vcpu_base);
+        send_event(boot_cpu, SGI_IPI_ID as _, IPI_EVENT_RESCHED);
+
         HyperCallResult::Ok(0)
     }
 
@@ -237,13 +252,20 @@ impl<'a> HyperCall<'a> {
                 )
             }
         };
-        let zone_w = zone.write();
 
-        zone_w.cpu_set().iter().for_each(|cpu_id| {
-            let _lock = get_cpu_data(cpu_id).ctrl_lock.lock();
-            get_cpu_data(cpu_id).cpu_on_entry = INVALID_ADDRESS;
-            send_event(cpu_id, SGI_IPI_ID as _, IPI_EVENT_SHUTDOWN);
-            // set the virtio irq list's len to 0
+        // Extract cpu_set under read lock only — do NOT hold write lock across IPI/wait.
+        // If we held the write lock here, target pCPUs running zone1 guest code could
+        // trap into EL2 (e.g. WFI, SPI) and try to acquire zone.read(), deadlocking.
+        let cpu_set: alloc::vec::Vec<usize> = zone.read().cpu_set().iter().collect();
+
+        cpu_set.iter().for_each(|&cpu_id| {
+            {
+                let _lock = get_cpu_data(cpu_id).ctrl_lock.lock();
+                get_cpu_data(cpu_id).cpu_on_entry = INVALID_ADDRESS;
+            }
+            // IPI_EVENT_ZONE_SHUTDOWN: target pCPU clears its scheduler queues,
+            // sets power_on=false, and re-enters el2_idle_loop (no vmreturn needed).
+            send_event(cpu_id, SGI_IPI_ID as _, IPI_EVENT_ZONE_SHUTDOWN);
             if let Some(irq_list) = map_irq.get_mut(&cpu_id) {
                 irq_list[0] = 0;
             }
@@ -251,10 +273,13 @@ impl<'a> HyperCall<'a> {
 
         let mut count: usize = 0;
 
-        // wait all zone's cpus shutdown
-        while zone_w.cpu_set().iter().any(|cpu_id| {
-            let _lock = get_cpu_data(cpu_id).ctrl_lock.lock();
-            let power_on = get_cpu_data(cpu_id).arch_cpu.power_on;
+        // Wait for all target pCPUs to set power_on=false (done in IPI_EVENT_ZONE_SHUTDOWN handler).
+        // Do NOT hold ctrl_lock across the spin — the handler acquires it to set power_on.
+        while cpu_set.iter().any(|&cpu_id| {
+            let power_on = {
+                let _lock = get_cpu_data(cpu_id).ctrl_lock.lock();
+                get_cpu_data(cpu_id).arch_cpu.power_on
+            };
             count += 1;
             if count > MAX_WAIT_TIMES {
                 if power_on {
@@ -265,12 +290,25 @@ impl<'a> HyperCall<'a> {
             power_on
         }) {}
 
-        zone_w.cpu_set().iter().for_each(|cpu_id| {
-            let _lock = get_cpu_data(cpu_id).ctrl_lock.lock();
-            get_cpu_data(cpu_id).zone = None;
-        });
-
-        drop(zone_w);
+        // All target pCPUs are now idle. Safe to acquire write lock for cleanup.
+        {
+            let mut zone_w = zone.write();
+            cpu_set.iter().for_each(|&cpu_id| {
+                let cpu = get_cpu_data(cpu_id);
+                let _lock = cpu.ctrl_lock.lock();
+                cpu.zone = None;
+                // Force-clear scheduler and current_vcpu so Arc<VCpu> refs are
+                // released even if the pCPU did not process IPI_EVENT_ZONE_SHUTDOWN
+                // (e.g. it was in el2_idle_loop and the SGI was missed).
+                cpu.scheduler.clear_all();
+                cpu.current_vcpu = None;
+            });
+            // Clear zone's vCPU map so that Arc<VCpu> refs (and their back-refs to
+            // Arc<Zone>) are all dropped, allowing Arc::strong_count to reach 1 at
+            // remove_zone.
+            zone_w.vcpus_mut().clear();
+            drop(zone_w);
+        }
         zone.arch_irqchip_reset();
         drop(zone);
 

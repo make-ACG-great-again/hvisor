@@ -330,11 +330,20 @@ pub fn drain_pending_wake_ids() {
     };
     for wake in wakes {
         if let Some(vcpu) = cpu.scheduler.find_blocked(wake.vcpu_id) {
+            // Common path: vCPU is still Blocked — inject IRQ and wake it.
             vcpu.push_pending_irq(wake.irq_id, wake.is_hardware);
             if vcpu.transition(VCpuState::Blocked, VCpuState::Ready).is_ok() {
                 cpu.scheduler.remove_blocked(wake.vcpu_id);
                 cpu.scheduler.enqueue(vcpu);
             }
+        } else if let Some(vcpu) = cpu.scheduler.find_ready(wake.vcpu_id) {
+            // Race: vCPU was woken by check_blocked_timers between the cross-pCPU push
+            // and this IPI handler.  The vCPU is already in the runqueue (Ready); just
+            // push the pending IRQ so it is drained when the vCPU is next switched in.
+            vcpu.push_pending_irq(wake.irq_id, wake.is_hardware);
         }
+        // If vCPU is Running (another tick switched it in already), push_pending_irq
+        // via current_vcpu is not needed — the SGI will be re-delivered when the next
+        // EL2 exit drains pending_virqs via vcpu_vmreturn.
     }
 }

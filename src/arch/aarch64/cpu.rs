@@ -208,9 +208,21 @@ impl ArchCpu {
         debug!("cpu {} begin to be idle", self.cpuid);
         assert!(this_cpu_id() == self.cpuid);
         let cpu_data = this_cpu_data();
-        let _lock = cpu_data.ctrl_lock.lock();
-        self.power_on = false;
-        drop(_lock);
+        {
+            let _lock = cpu_data.ctrl_lock.lock();
+            self.power_on = false;
+        }
+        // Re-enter the scheduler loop so this pCPU can be reused by a future zone_start.
+        info!("cpu {} idle, re-entering scheduler loop", self.cpuid);
+        loop {
+            crate::scheduler::schedule();
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn park(&mut self) -> ! {
+        debug!("cpu {} begin parking", self.cpuid);
+        assert!(this_cpu_id() == self.cpuid);
 
         // reset current cpu -> pc = 0x0 (wfi)
         PARKING_MEMORY_SET.call_once(|| {

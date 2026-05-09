@@ -139,8 +139,26 @@ impl El1SysRegs {
         self.cntvoff_el2    = read_sysreg!(CNTVOFF_EL2);
         self.cntp_ctl_el0   = read_sysreg!(CNTP_CTL_EL0);
         self.cntp_cval_el0  = read_sysreg!(CNTP_CVAL_EL0);
-        self.cntv_ctl_el0   = read_sysreg!(CNTV_CTL_EL0);
         self.cntv_cval_el0  = read_sysreg!(CNTV_CVAL_EL0);
+        // Save CNTV_CTL with IMASK policy:
+        // - ISTATUS=1 (timer expired): set IMASK=1 to suppress the physical IRQ 27 signal
+        //   while this vCPU is off-CPU, preventing it from interfering with other vCPUs.
+        // - ISTATUS=0 (timer handled or not yet expired): clear IMASK=0 so the guest's
+        //   intended timer delivery mode is preserved.  IMASK may have been set by the
+        //   hypervisor (vcpu_vmreturn / truly_alone path) as a temporary measure; once
+        //   ISTATUS=0 the guest has handled the interrupt, so we restore IMASK=0.
+        let cntv_ctl = read_sysreg!(CNTV_CTL_EL0);
+        let timer_enabled = (cntv_ctl & 1) != 0;
+        let timer_expired = (cntv_ctl & 4) != 0; // ISTATUS
+        if timer_enabled && timer_expired {
+            let masked = cntv_ctl | 2; // set IMASK
+            write_sysreg!(CNTV_CTL_EL0, masked); // suppress physical IRQ 27 immediately
+            self.cntv_ctl_el0 = masked;
+        } else {
+            // Clear IMASK — hypervisor may have set it temporarily, but ISTATUS=0 means
+            // the guest has handled the interrupt (or it hasn't fired yet).
+            self.cntv_ctl_el0 = cntv_ctl & !2u64; // clear IMASK
+        }
         self.cntkctl_el1    = read_sysreg!(CNTKCTL_EL1);
     }
 
@@ -173,17 +191,18 @@ impl El1SysRegs {
         write_sysreg!(CNTP_CVAL_EL0,  self.cntp_cval_el0);
         write_sysreg!(CNTV_CVAL_EL0,  self.cntv_cval_el0);
         // Restore virtual timer control.
-        // If already expired (ISTATUS=1), mask hardware delivery (IMASK=1) to prevent
-        // an immediate IRQ 27 flood on restore. IRQ 27 will be injected via the
-        // software path: sched_tick_handler Step 3 (running vCPU) or
-        // check_blocked_timers (blocked vCPU).
+        // If already expired (ISTATUS=1): mask hardware delivery (IMASK=1) to prevent
+        // an immediate physical IRQ 27 on restore. sched_tick_handler Step 3 or
+        // check_blocked_timers will inject IRQ 27 via the software pending path.
+        // If ISTATUS=0: restore with IMASK=0 (save_from_hardware already cleared it)
+        // so the guest's normal hardware timer delivery path works correctly.
         let cntv_ctl = self.cntv_ctl_el0;
         let timer_enabled = (cntv_ctl & 1) != 0;
         let timer_expired = (cntv_ctl & 4) != 0; // ISTATUS
         if timer_enabled && timer_expired {
             write_sysreg!(CNTV_CTL_EL0, cntv_ctl | 2); // set IMASK
         } else {
-            write_sysreg!(CNTV_CTL_EL0, cntv_ctl);
+            write_sysreg!(CNTV_CTL_EL0, cntv_ctl & !2u64); // ensure IMASK=0
         }
         write_sysreg!(CNTKCTL_EL1, self.cntkctl_el1);
         write_sysreg!(PMCR_EL0, 0);

@@ -248,11 +248,22 @@ impl Cmdq {
         let mut new_cmd = value.clone();
         let binding = this_zone();
         let zone = binding.read();
-        let cpuset_bitmap = zone.cpu_set().bitmap;
 
+        // In 1:N overcommit, vicid (guest collection ID = guest MPIDR Aff0 = zone-local
+        // vCPU index) no longer equals a pCPU index. Look up the vCPU by guest MPIDR to
+        // find which pCPU it is bound to, and use that as the physical ICID.
         let vicid_to_icid_checked = |vicid: u64| -> u64 {
-            vicid_to_icid(vicid, cpuset_bitmap)
-                .expect("vicid to icid failed, maybe logical_id out of range")
+            use crate::zone::GuestMpidr;
+            let mpidr = GuestMpidr::new(vicid);
+            zone.get_vcpu_by_guest_mpidr(mpidr)
+                .map(|vcpu| vcpu.get_pcpu_affinity() as u64)
+                .unwrap_or_else(|| {
+                    // Fallback for 1:1: if no vCPU map entry, treat vicid as pCPU index
+                    // (legacy behaviour preserved when guest_mpidr_to_vcpu is not populated)
+                    let cpuset_bitmap = zone.cpu_set().bitmap;
+                    vicid_to_icid(vicid, cpuset_bitmap)
+                        .expect("vicid to icid failed, maybe logical_id out of range")
+                })
         };
         let set_cmd2_icid = |cmd2: &mut u64, icid: u64| {
             *cmd2 &= !0xffffu64;

@@ -188,8 +188,13 @@ impl PerCpuScheduler {
             let blocked_at = entry.blocked_at_cnt;
             let one_tick   = crate::arch::timer::tick_period_cnt();
             let timed_out  = current_cnt >= blocked_at.wrapping_add(one_tick);
-            let ten_ticks  = one_tick.wrapping_mul(10);
-            let absolute_timeout = current_cnt >= blocked_at.wrapping_add(ten_ticks);
+            // Absolute timeout: 2 ticks (20ms) instead of 10 (100ms).
+            // In 1:N overcommit each vCPU runs every N*tick_period, so a blocked
+            // vCPU relying on this backstop would stall for up to N*100ms before
+            // getting a chance to run — enough to trigger Linux RCU stall warnings.
+            // 2 ticks keeps the worst-case wakeup latency under 40ms (2 pCPUs * 20ms).
+            let two_ticks  = one_tick.wrapping_mul(2);
+            let absolute_timeout = current_cnt >= blocked_at.wrapping_add(two_ticks);
             let no_timer_timeout = (timed_out && entry.vcpu.has_pending_irqs())
                 || absolute_timeout;
 
@@ -255,9 +260,29 @@ impl PerCpuScheduler {
             .map(|e| e.vcpu.clone())
     }
 
+    /// Find a Ready VCpu in the run queues by id without removing it.
+    pub fn find_ready(&self, vcpu_id: usize) -> Option<Arc<VCpu>> {
+        for prio in 0..NUM_PRIORITIES {
+            if let Some(v) = self.run_queue[prio].iter().find(|v| v.id == vcpu_id) {
+                return Some(v.clone());
+            }
+        }
+        None
+    }
+
     /// Check if there are any blocked VCpus.
     pub fn has_blocked_vcpus(&self) -> bool {
         !self.blocked_vcpus.is_empty()
+    }
+
+    /// Number of blocked VCpus.
+    pub fn blocked_vcpu_count(&self) -> usize {
+        self.blocked_vcpus.len()
+    }
+
+    /// Return (cntv_cval, cntv_ctl, cntvoff, blocked_at) of the first blocked entry, for diagnostics.
+    pub fn first_blocked_timer_info(&self) -> Option<(u64, u64, u64, u64)> {
+        self.blocked_vcpus.front().map(|e| (e.cntv_cval, e.cntv_ctl, e.cntvoff, e.blocked_at_cnt))
     }
 
     /// Return the earliest blocked VCpu timer expiry (as physical CNTPCT).
@@ -279,8 +304,38 @@ impl PerCpuScheduler {
 /// Here we only save EL1 system registers + GIC virtualization state.
 #[cfg(target_arch = "aarch64")]
 pub fn vcpu_switch_out(vcpu: &VCpu) {
+    use crate::arch::sysreg::read_sysreg;
+
     // DSB ISH: ensure all guest EL1 stores are visible before saving context.
     unsafe { core::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
+
+    // Before saving GIC state: scan LRs for any HW=0 Pending entry for IRQ 27.
+    // If found, retract it back into the vCPU's pending_irqs queue and clear the LR.
+    // This prevents a HW=0/HW=1 conflict when the vCPU is next scheduled in:
+    // the saved LR would be restored while the physical IRQ 27 is also pending in GIC.
+    // On switch-in, drain_pending_irqs() re-injects IRQ 27 cleanly at the right time.
+    {
+        use crate::device::irqchip::gicv3::{read_lr, write_lr};
+        let vtr = read_sysreg!(ich_vtr_el2) as usize;
+        let lr_num = (vtr & 0xf) + 1;
+        for i in 0..lr_num {
+            let lr_val = read_lr(i);
+            let virt_id = (lr_val & 0xffff_ffff) as usize;
+            // LR state: bits [63:62] — 00=Invalid, 01=Pending, 10=Active, 11=Active+Pending
+            let lr_state = (lr_val >> 62) & 0x3;
+            // HW bit: bit 61
+            let hw = (lr_val >> 61) & 0x1;
+            // Retract only if: IRQ 27, HW=0 (software-injected), Pending (not yet Active)
+            if virt_id == 27 && hw == 0 && (lr_state & 0x1) != 0 {
+                // Clear this LR
+                write_lr(i, 0);
+                // Put IRQ 27 back in the pending queue for re-injection on next switch-in
+                vcpu.push_pending_irq(27, false);
+                trace!("[SCH-OUT] retracted IRQ 27 HW=0 LR[{}] state={} -> pending_irqs", i, lr_state);
+                break;
+            }
+        }
+    }
 
     unsafe {
         let arch = &vcpu.arch as *const _ as *mut crate::arch::vcpu::ArchVCpu;
@@ -330,11 +385,10 @@ pub fn vcpu_switch_in(vcpu: &VCpu, prev_zone_id: Option<usize>) {
         vcpu.activate_gpm();
     }
 
-    // Drain pending_virqs and inject into GIC LRs
-    let pending = vcpu.drain_pending_irqs();
-    for pirq in pending {
-        crate::device::irqchip::inject_irq(pirq.irq_id, pirq.is_hardware);
-    }
+    // Pending IRQ injection is handled by vcpu_vmreturn() after schedule() returns,
+    // so that there is exactly one drain+inject point per EL2 exit regardless of
+    // whether a context switch occurred.  vcpu_vmreturn() carries the IRQ-27
+    // physical-arrival filter, so no special handling is needed here.
 }
 
 // ========================

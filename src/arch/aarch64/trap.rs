@@ -154,18 +154,72 @@ pub fn arch_handle_exit(regs: &mut TrapFrame, exit_reason: u64) -> ! {
         crate::scheduler::schedule();
     }
 
-    // Drain any pending_virqs for the current vCPU.
-    if let Some(ref vcpu) = this_cpu_data().current_vcpu {
-        let pending = vcpu.drain_pending_irqs();
-        for pirq in pending {
-            crate::device::irqchip::inject_irq(pirq.irq_id, pirq.is_hardware);
+    vcpu_vmreturn()
+}
+
+/// Final step before returning to guest: drain pending IRQs and eret.
+///
+/// This is the single drain+inject point for every EL2 exit, regardless of
+/// whether schedule() ran a context switch.  Keeping injection here (rather
+/// than also in vcpu_switch_in) avoids the double-inject race where:
+///   schedule() → vcpu_switch_in() injects IRQ 27 HW=0
+///   sched_tick_handler pushes another IRQ 27 into pending_virqs
+///   vcpu_vmreturn() injects a second HW=0 LR → GIC conflict
+///
+/// IRQ 27 filter: if CNTV is enabled, unmasked, and already expired (ISTATUS=1),
+/// the physical IRQ 27 will arrive as HW=1 via the EL1-IRQ path on its own.
+/// Injecting a HW=0 LR on top creates a Pending HW=0/HW=1 conflict causing
+/// Active-state leaks and warn floods. Drop the HW=0 entry in that case.
+///
+/// If current_vcpu is None (e.g. after IPI_EVENT_ZONE_SHUTDOWN cleared it),
+/// re-enter the scheduler (el2_idle_loop) instead.
+fn vcpu_vmreturn() -> ! {
+    use crate::arch::sysreg::{read_sysreg, write_sysreg};
+    loop {
+        if let Some(ref vcpu) = this_cpu_data().current_vcpu {
+            // Compute once: will physical IRQ 27 arrive naturally (HW=1)?
+            let irq27_will_arrive_physically = {
+                let cntv_ctl: u64 = read_sysreg!(CNTV_CTL_EL0);
+                let enabled = (cntv_ctl & 1) != 0;
+                let masked  = (cntv_ctl & 2) != 0; // IMASK
+                let expired = (cntv_ctl & 4) != 0; // ISTATUS
+                enabled && !masked && expired
+            };
+
+            let pending = vcpu.drain_pending_irqs();
+            for pirq in pending {
+                if pirq.irq_id == 27 && !pirq.is_hardware {
+                    if irq27_will_arrive_physically {
+                        // Physical IRQ 27 (HW=1) is already pending/asserted and unmasked.
+                        // Injecting HW=0 on top causes a Pending HW=0/HW=1 conflict.
+                        // Drop the SW entry and let hardware deliver it naturally.
+                        trace!("[VMRET] dropped pending IRQ 27 HW=0: physical HW=1 will arrive naturally");
+                        continue;
+                    }
+                    // Injecting HW=0 for IRQ 27: set IMASK=1 first to suppress the
+                    // physical IRQ 27 signal while the HW=0 LR is pending in GIC.
+                    // Without IMASK=1 the physical IRQ stays asserted and re-fires
+                    // as EL1-IRQ before the guest has consumed the HW=0 LR, causing
+                    // the "HW=0 Pending conflict" warn flood in gic_handle_irq.
+                    // IMASK will be cleared when the vCPU is next switched out and
+                    // save_from_hardware observes ISTATUS=0 (timer handled by guest).
+                    let cntv_ctl = read_sysreg!(CNTV_CTL_EL0);
+                    if (cntv_ctl & 1) != 0 {
+                        write_sysreg!(CNTV_CTL_EL0, cntv_ctl | 2); // set IMASK
+                    }
+                }
+                crate::device::irqchip::inject_irq(pirq.irq_id, pirq.is_hardware);
+            }
+
+            let trapframe_ptr = vcpu.arch.trapframe_ptr();
+            unsafe { vmreturn(trapframe_ptr) }
+        } else {
+            // No current vCPU — re-enter scheduler (el2_idle_loop).
+            // This happens after IPI_EVENT_ZONE_SHUTDOWN clears current_vcpu.
+            crate::scheduler::schedule();
+            // schedule() picked a new vCPU: loop back to drain+vmreturn it.
         }
     }
-
-    let trapframe_ptr = this_cpu_data()
-        .current_vcpu.as_ref().unwrap()
-        .arch.trapframe_ptr();
-    unsafe { vmreturn(trapframe_ptr) }
 }
 
 fn irqchip_handle_irq1() {
@@ -308,11 +362,14 @@ fn handle_wfi_trap(regs: &mut TrapFrame) {
     let timer_already_expired = (cntv_ctl & 0x5) == 0x5; // ENABLE=1, ISTATUS=1
 
     if truly_alone && timer_already_expired {
-        // Timer already fired — skip WFI immediately and return to guest.
-        // sched_tick_handler Step 3 will inject IRQ 27 on the next EL2 tick (≤10ms).
-        // Do NOT inject_irq(27, false) here: it creates a HW=0 LR that conflicts
-        // with the physical IRQ 27 delivery (HW=1), causing Active state leaks.
+        // Timer already fired, vCPU is alone on pCPU (no switch-out ever ran).
+        // Set IMASK=1 before injecting HW=0 to suppress the physical IRQ 27 signal.
+        // Without IMASK=1, the physical CNTV stays asserted (ISTATUS=1, IMASK=0)
+        // and fires as EL1-IRQ immediately after eret, before the guest has consumed
+        // the HW=0 LR — causing the "HW=0 Pending conflict" warn in gic_handle_irq.
+        write_sysreg!(CNTV_CTL_EL0, cntv_ctl | 2); // set IMASK=1
         drop(vcpu);
+        crate::device::irqchip::inject_irq(27, false);
         arch_skip_instruction(regs);
     } else if truly_alone {
         // Timer not yet expired — real EL2 WFI until next physical IRQ.
@@ -481,9 +538,26 @@ fn deliver_sgi_to_vcpu(vcpu: &alloc::sync::Arc<crate::vcpu::VCpu>, sgi_id: usize
             }
         }
         VCpuState::Ready => {
-            // Already in runqueue — IRQ will be drained on next switch-in.
+            // Already in runqueue — push IRQ so it is drained on next switch-in.
             vcpu.push_pending_irq(sgi_id, false);
-            cpu.need_resched.store(true, core::sync::atomic::Ordering::Release);
+            let target_pcpu  = vcpu.get_pcpu_affinity();
+            let current_pcpu = cpu.id;
+            if target_pcpu == current_pcpu {
+                // Same pCPU: need_resched will trigger schedule() at next EL2 exit.
+                cpu.need_resched.store(true, core::sync::atomic::Ordering::Release);
+            } else {
+                // Cross-pCPU: notify the target pCPU so it reschedules promptly.
+                // Without this IPI the target pCPU may not learn about the new
+                // pending IRQ until its next tick (up to 10 ms), causing SGI-based
+                // synchronisation barriers in the guest to stall.
+                let target_cpu_data = crate::cpu_data::get_cpu_data(target_pcpu);
+                target_cpu_data.need_resched.store(true, core::sync::atomic::Ordering::Release);
+                crate::event::send_event(
+                    target_pcpu,
+                    crate::hypercall::SGI_IPI_ID as _,
+                    crate::event::IPI_EVENT_RESCHED,
+                );
+            }
         }
         VCpuState::Running => {
             // Running on another pCPU — send IPI_EVENT_RESCHED so the target pCPU

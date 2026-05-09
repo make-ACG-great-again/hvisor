@@ -24,16 +24,15 @@ use core::arch::asm;
 use core::ptr::write_volatile;
 use core::sync::atomic::AtomicU64;
 
-use alloc::collections::vec_deque::VecDeque;
 use alloc::vec::Vec;
 use gicr::init_lpi_prop;
 use gits::gits_init;
-use spin::{Lazy, Mutex, Once};
+use spin::{Lazy, Once};
 
 use self::gicd::{enable_gic_are_ns, GICD_ICACTIVER, GICD_ICENABLER};
 use self::gicr::enable_ipi;
 use crate::arch::aarch64::sysreg::{read_sysreg, smc_arg1, write_sysreg};
-use crate::arch::cpu::{cpuid_to_mpidr_affinity, this_cpu_id};
+use crate::arch::cpu::cpuid_to_mpidr_affinity;
 use crate::arch::zone::GicConfig;
 use crate::config::root_zone_config;
 use crate::consts::{self, MAX_CPU_NUM};
@@ -103,7 +102,7 @@ pub fn gicv3_handle_irq_el1() {
             }
             if !ipi_handled {
                 trace!("sgi get {}, inject", irq_id);
-                inject_irq(irq_id, false);
+                schedule_inject_irq(irq_id, false);
             }
         } else if irq_id < 16 {
             warn!("skip sgi {}", irq_id);
@@ -146,11 +145,11 @@ pub fn gicv3_handle_irq_el1() {
             let hw0_conflict = if is_hardware_irq(irq_id) {
                 find_lr_hw0(irq_id)
             } else {
-                false
+                Hw0Conflict::None
             };
 
             let lr_written = if irq_id != 25 {
-                inject_irq(irq_id, true)
+                schedule_inject_irq(irq_id, true)
             } else {
                 true
             };
@@ -162,10 +161,36 @@ pub fn gicv3_handle_irq_el1() {
             // In both cases: EOIR already done above, now safe to DIR.
             if irq_id == 27 && !lr_written {
                 write_sysreg!(icc_dir_el1, 27u64);
+                // IRQ 27 (CNTV) is level-triggered: if ISTATUS=1 and IMASK=0, it becomes
+                // Pending again immediately after DIR. With no current vCPU (e.g. idle pCPU
+                // after zone shutdown), this causes an infinite IRQ-27 delivery loop.
+                // Set IMASK=1 to suppress hardware delivery. The IRQ will be re-delivered
+                // when a vCPU is scheduled in and restore_to_hardware clears IMASK (or
+                // sched_tick_handler Step 3 injects it via the software path).
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let cntv_ctl = read_sysreg!(CNTV_CTL_EL0);
+                    if (cntv_ctl & 1) != 0 {
+                        write_sysreg!(CNTV_CTL_EL0, cntv_ctl | 2); // set IMASK
+                    }
+                }
             }
-            if hw0_conflict {
-                write_sysreg!(icc_dir_el1, irq_id as u64);
-                warn!("irq {} LR HW=0 conflict: wrote DIR after EOIR", irq_id);
+            match hw0_conflict {
+                Hw0Conflict::None => {}
+                Hw0Conflict::Active => {
+                    // Guest is mid-handler for a HW=0 IRQ 27 (normal in 1:N overcommit:
+                    // physical timer fired again while guest was handling the previous one).
+                    // DIR deactivates the physical Active state; guest EOI handles the virtual.
+                    write_sysreg!(icc_dir_el1, irq_id as u64);
+                    trace!("irq {} HW=0 Active conflict (1:N normal): wrote DIR", irq_id);
+                }
+                Hw0Conflict::Pending => {
+                    // Guest hasn't accepted the HW=0 LR yet. Physical IRQ arrived on top.
+                    // DIR to clear physical Active state. This shouldn't happen if
+                    // vcpu_switch_out correctly retracts pending HW=0 LR entries.
+                    write_sysreg!(icc_dir_el1, irq_id as u64);
+                    warn!("irq {} HW=0 Pending conflict: wrote DIR (check vcpu_switch_out retract logic)", irq_id);
+                }
             }
         }
     }
@@ -178,10 +203,21 @@ fn is_hardware_irq(irq_id: usize) -> bool {
     irq_id >= 16
 }
 
-/// Returns true if any LR holds irq_id as a software-only (HW=0) entry.
-/// Used to detect the conflict where a physical IRQ arrives while a HW=0 LR
-/// entry already exists — guest EOI won't deactivate the physical Active state.
-fn find_lr_hw0(irq_id: usize) -> bool {
+/// LR conflict descriptor: distinguishes Pending-only from Active HW=0 entries.
+/// Only a Pending HW=0 entry is a true conflict (guest hasn't accepted the IRQ yet,
+/// but physical Active state won't be cleared by guest EOI).
+/// An Active HW=0 entry means the guest is mid-handler — DIR is still needed, but
+/// this is a normal 1:N overcommit situation, not a bug.
+#[derive(PartialEq)]
+enum Hw0Conflict {
+    None,
+    /// LR state = Pending or Active+Pending — guest hasn't accepted yet
+    Pending,
+    /// LR state = Active only — guest is mid-handler
+    Active,
+}
+
+fn find_lr_hw0(irq_id: usize) -> Hw0Conflict {
     const LR_VIRTIRQ_MASK: usize = (1 << 32) - 1;
     let vtr = read_sysreg!(ich_vtr_el2) as usize;
     let lr_num = (vtr & 0xf) + 1;
@@ -192,10 +228,16 @@ fn find_lr_hw0(irq_id: usize) -> bool {
         }
         let lr_val = read_lr(i) as usize;
         if (lr_val & LR_VIRTIRQ_MASK) == irq_id && (lr_val & (1 << 61)) == 0 {
-            return true; // found HW=0 entry for this irq_id
+            // bits[63:62]: 01=Pending, 10=Active, 11=Active+Pending
+            let state = (lr_val >> 62) & 0x3;
+            if state & 0x1 != 0 {
+                return Hw0Conflict::Pending; // Pending or Active+Pending
+            } else {
+                return Hw0Conflict::Active; // Active only
+            }
         }
     }
-    false
+    Hw0Conflict::None
 }
 
 fn pending_irq() -> Option<usize> {
@@ -217,7 +259,7 @@ fn deactivate_irq(irq_id: usize) {
     }
 }
 
-fn read_lr(id: usize) -> u64 {
+pub fn read_lr(id: usize) -> u64 {
     let id = id as u64;
     match id {
         //TODO get lr size from gic reg
@@ -244,7 +286,7 @@ fn read_lr(id: usize) -> u64 {
     }
 }
 
-fn write_lr(id: usize, val: u64) {
+pub fn write_lr(id: usize, val: u64) {
     let id = id as u64;
     match id {
         0 => write_sysreg!(ich_lr0_el2, val),
@@ -270,50 +312,12 @@ fn write_lr(id: usize, val: u64) {
     }
 }
 
-// virtual interrupts waiting to inject
-static PENDING_VIRQS: Once<PendingIrqs> = Once::new();
 pub const MAINTENACE_INTERRUPT: u64 = 25;
-struct PendingIrqs {
-    inner: Vec<Mutex<VecDeque<(usize, bool)>>>,
-}
 
-impl PendingIrqs {
-    fn new(max_cpus: usize) -> Self {
-        let mut vs = vec![];
-        for _ in 0..max_cpus {
-            let v = Mutex::new(VecDeque::new());
-            vs.push(v)
-        }
-        Self { inner: vs }
-    }
-
-    fn add_irq(&self, irq_id: usize, is_hardware: bool) -> Option<()> {
-        match self.inner.get(this_cpu_id()) {
-            Some(pending_irqs) => {
-                let mut irqs = pending_irqs.lock();
-                irqs.push_back((irq_id, is_hardware));
-                Some(())
-            }
-            _ => None,
-        }
-    }
-
-    fn fetch_irq(&self) -> Option<(usize, bool)> {
-        match self.inner.get(this_cpu_id()) {
-            Some(pending_irqs) => {
-                let mut irqs = pending_irqs.lock();
-                irqs.pop_front()
-            }
-            _ => None,
-        }
-    }
-}
-
-// Enable or disable an underflow maintenace interrupt.
+// Enable or disable an underflow maintenance interrupt.
 fn enable_maintenace_interrupt(is_enable: bool) {
     trace!("enable_maintenace_interrupt, is_enable is {}", is_enable);
     let mut hcr = read_sysreg!(ich_hcr_el2);
-    trace!("hcr is {}", hcr);
     if is_enable {
         hcr |= ICH_HCR_UIE;
     } else {
@@ -322,21 +326,142 @@ fn enable_maintenace_interrupt(is_enable: bool) {
     write_sysreg!(ich_hcr_el2, hcr);
 }
 
+/// Maintenance interrupt handler.
+///
+/// LR slots have become free (UIE = underflow). Drain the current running
+/// vCPU's per-vCPU pending_virqs queue and inject as many as possible into
+/// the newly freed LR slots. If LRs fill up again, keep UIE enabled so we
+/// get called again when more slots free up.
 fn handle_maintenace_interrupt() {
     trace!("handle_maintenace_interrupt");
-    let pending_irqs = PENDING_VIRQS.get().unwrap();
-    while let Some((irq_id, is_hardware)) = pending_irqs.fetch_irq() {
-        let is_injected: bool = inject_irq(irq_id, is_hardware);
-        if is_injected {
-            trace!("inject pending irq in maintenace interrupt");
-        }
-        if !is_injected {
-            pending_irqs.add_irq(irq_id, is_hardware);
-            enable_maintenace_interrupt(true);
+    use crate::cpu_data::this_cpu_data;
+    let cpu = this_cpu_data();
+    let vcpu = match cpu.scheduler.current.as_ref() {
+        Some(v) => v.clone(),
+        None => {
+            enable_maintenace_interrupt(false);
             return;
         }
+    };
+
+    let pending = vcpu.drain_pending_irqs();
+    let mut deferred: Vec<crate::vcpu::PendingIrq> = Vec::new();
+    for pirq in pending {
+        if inject_irq(pirq.irq_id, pirq.is_hardware) {
+            trace!("inject pending irq {} in maintenance interrupt", pirq.irq_id);
+        } else {
+            // LR full again — put remaining back
+            deferred.push(pirq);
+        }
     }
-    enable_maintenace_interrupt(false);
+    if deferred.is_empty() {
+        enable_maintenace_interrupt(false);
+    } else {
+        for pirq in deferred {
+            vcpu.push_pending_irq(pirq.irq_id, pirq.is_hardware);
+        }
+        enable_maintenace_interrupt(true);
+    }
+}
+
+/// Schedule-aware IRQ injection.
+///
+/// Routes the IRQ to the correct target vCPU:
+///   - For PPI/SGI (irq < 32): targets the current vCPU on this pCPU.
+///   - For SPI (irq >= 32): checks irq_target_vcpu mapping (set by GICD_IROUTER
+///     writes) to find the intended vCPU. If the target is the current vCPU,
+///     inject directly. If it is a different vCPU (Blocked/Ready on the same
+///     pCPU), push to that vCPU's pending queue and wake it. If it lives on
+///     another pCPU, push a PendingWake and send IPI_EVENT_RESCHED.
+///
+/// Returns true if an LR entry was written (caller may skip DIR for HW IRQs).
+pub fn schedule_inject_irq(irq_id: usize, is_hardware: bool) -> bool {
+    use crate::cpu_data::{get_cpu_data, this_cpu_data, PendingWake};
+    use crate::vcpu::VCpuState;
+
+    let cpu = this_cpu_data();
+
+    // For SPI, look up the target vCPU from the IROUTER mapping.
+    if irq_id >= 32 {
+        if let Some(ref zone_arc) = cpu.zone {
+            let zone = zone_arc.read();
+            if let Some(target_vcpu_id) = zone.irq_target_vcpu.get(irq_id).copied().flatten() {
+                let is_current = cpu
+                    .current_vcpu
+                    .as_ref()
+                    .map(|v| v.id == target_vcpu_id)
+                    .unwrap_or(false);
+
+                if !is_current {
+                    if let Some(target_vcpu) = zone.vcpus().get(&target_vcpu_id).cloned() {
+                        let target_pcpu = target_vcpu.get_pcpu_affinity();
+                        let current_pcpu = cpu.id;
+                        drop(zone);
+
+                        if target_pcpu == current_pcpu {
+                            target_vcpu.push_pending_irq(irq_id, is_hardware);
+                            if target_vcpu.state() == VCpuState::Blocked {
+                                if target_vcpu
+                                    .transition(VCpuState::Blocked, VCpuState::Ready)
+                                    .is_ok()
+                                {
+                                    cpu.scheduler.remove_blocked(target_vcpu_id);
+                                    cpu.scheduler.enqueue(target_vcpu);
+                                    cpu.need_resched
+                                        .store(true, core::sync::atomic::Ordering::Release);
+                                }
+                            }
+                        } else {
+                            // Cross-pCPU: push PendingWake and send IPI_EVENT_RESCHED.
+                            let target_cpu_data = get_cpu_data(target_pcpu);
+                            target_cpu_data
+                                .pending_wake_ids
+                                .lock()
+                                .push_back(PendingWake {
+                                    vcpu_id: target_vcpu_id,
+                                    irq_id,
+                                    is_hardware,
+                                });
+                            crate::event::send_event(
+                                target_pcpu,
+                                crate::hypercall::SGI_IPI_ID as _,
+                                crate::event::IPI_EVENT_RESCHED,
+                            );
+                        }
+                        // LR not written — caller must DIR for HW-mapped IRQs.
+                        return false;
+                    }
+                }
+            }
+            // No specific target or target == current: fall through.
+        }
+    }
+
+    // Default: inject into the current vCPU on this pCPU.
+    if let Some(ref vcpu) = cpu.current_vcpu {
+        if vcpu.state() == VCpuState::Running {
+            return inject_irq(irq_id, is_hardware);
+        }
+        vcpu.push_pending_irq(irq_id, is_hardware);
+        if vcpu.state() == VCpuState::Blocked {
+            if vcpu
+                .transition(VCpuState::Blocked, VCpuState::Ready)
+                .is_ok()
+            {
+                cpu.scheduler.remove_blocked(vcpu.id);
+                cpu.scheduler.enqueue(vcpu.clone());
+                cpu.need_resched
+                    .store(true, core::sync::atomic::Ordering::Release);
+            }
+        }
+        return false;
+    }
+
+    warn!(
+        "schedule_inject_irq: no current vCPU on CPU {}, dropping IRQ {}",
+        cpu.id, irq_id
+    );
+    false
 }
 
 /// Inject virtual interrupt to vCPU, return whether it not needs to add pending queue.
@@ -366,16 +491,25 @@ pub fn inject_irq(irq_id: usize, is_hardware: bool) -> bool {
     trace!("To Inject IRQ {}, find lr {}", irq_id, free_ir);
 
     if free_ir == -1 {
-        trace!("all list registers are valid, add to pending queue");
-        // If all list registers are valid, add this virtual irq to pending queue,
-        // and enable an underflow maintenace interrupt. When list registers are
-        // all invalid or only one is valid, the maintenace interrupt will occur,
-        // hvisor will execute handle_maintenace_interrupt function.
-        PENDING_VIRQS
-            .get()
-            .unwrap()
-            .add_irq(irq_id, is_hardware)
-            .unwrap();
+        trace!("all list registers are valid, add to per-vcpu pending queue");
+        // LR slots all occupied — store in the current vCPU's per-vCPU pending
+        // queue and enable the UIE maintenance interrupt. When LR slots free up,
+        // handle_maintenace_interrupt() drains from this same queue and injects
+        // into the correct vCPU (whichever is Running at that point — which will
+        // always be the same vCPU since we only inject for the current runner).
+        //
+        // Note: if there is no current vCPU (schedule() is mid-flight with
+        // current=None), we cannot queue the IRQ. For hardware-mapped IRQs the
+        // caller is responsible for writing DIR after EOIR to prevent a
+        // permanent Active leak (gicv3_handle_irq_el1 already does this via the
+        // lr_written=false path). For software IRQs (is_hardware=false) the
+        // signal is level-sensitive and will be re-delivered naturally.
+        use crate::cpu_data::this_cpu_data;
+        if let Some(vcpu) = this_cpu_data().scheduler.current.as_ref() {
+            vcpu.push_pending_irq(irq_id, is_hardware);
+        } else {
+            warn!("inject_irq: LR full, no current vCPU, IRQ {} (hw={}) deferred to re-delivery", irq_id, is_hardware);
+        }
         enable_maintenace_interrupt(true);
         return false;
     } else {
@@ -524,8 +658,6 @@ pub fn primary_init_early() {
     if host_gits_base() != 0 && host_gits_size() != 0 {
         gits_init();
     }
-
-    PENDING_VIRQS.call_once(|| PendingIrqs::new(MAX_CPU_NUM));
 
     // Force CPU_GICR_BASE Lazy initialization here, while running single-threaded
     // with IRQs disabled (primary_init_early runs before primary_init_late/enable_irqs).
