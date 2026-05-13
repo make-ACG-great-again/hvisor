@@ -338,12 +338,17 @@ pub fn drain_pending_wake_ids() {
             }
         } else if let Some(vcpu) = cpu.scheduler.find_ready(wake.vcpu_id) {
             // Race: vCPU was woken by check_blocked_timers between the cross-pCPU push
-            // and this IPI handler.  The vCPU is already in the runqueue (Ready); just
-            // push the pending IRQ so it is drained when the vCPU is next switched in.
+            // and this IPI handler. Already in runqueue; push IRQ for next switch-in.
             vcpu.push_pending_irq(wake.irq_id, wake.is_hardware);
+        } else if let Some(ref vcpu) = cpu.scheduler.current {
+            // Race: vCPU is already Running (switched in before IPI arrived).
+            // Push IRQ directly — vcpu_vmreturn will drain it on the next EL2 exit.
+            if vcpu.id == wake.vcpu_id {
+                vcpu.push_pending_irq(wake.irq_id, wake.is_hardware);
+            }
+            // If vcpu_id doesn't match current, the vCPU is Stopped or on another pCPU.
+            // Stopped: SGI to a stopped vCPU is discarded (correct).
+            // Another pCPU: shouldn't happen since drain_pending_wake_ids is local-only.
         }
-        // If vCPU is Running (another tick switched it in already), push_pending_irq
-        // via current_vcpu is not needed — the SGI will be re-delivered when the next
-        // EL2 exit drains pending_virqs via vcpu_vmreturn.
     }
 }

@@ -372,9 +372,14 @@ fn handle_wfi_trap(regs: &mut TrapFrame) {
         crate::device::irqchip::inject_irq(27, false);
         arch_skip_instruction(regs);
     } else if truly_alone {
-        // Timer not yet expired — real EL2 WFI until next physical IRQ.
+        // Timer not yet expired — real EL2 WFI until vCPU timer fires.
+        // Arm EL2 timer precisely at the vCPU's CNTV expiry (physical = cval + cntvoff)
+        // so the WFI wakes exactly when the guest timer is due, not after a full 10ms tick.
+        let cntv_cval = read_sysreg!(CNTV_CVAL_EL0);
+        let cntvoff   = read_sysreg!(CNTVOFF_EL2);
+        let target_pct = cntv_cval.wrapping_add(cntvoff);
         drop(vcpu);
-        crate::arch::timer::el2_timer_rearm();
+        crate::arch::timer::el2_timer_arm_at(target_pct);
         unsafe { core::arch::asm!("msr daifclr, #0xf") };
         aarch64_cpu::asm::wfi();
         unsafe { core::arch::asm!("msr daifset, #0xf") };
@@ -388,7 +393,14 @@ fn handle_wfi_trap(regs: &mut TrapFrame) {
         // Do real EL2 WFI so pCPU stays responsive. Advance PC first.
         arch_skip_instruction(regs);
         drop(vcpu);
-        crate::arch::timer::el2_timer_rearm();
+        // Arm timer precisely at the earliest blocked vCPU's virtual timer expiry
+        // rather than a fixed 10ms tick. This ensures blocked vCPUs relying on
+        // short nanosleep/hrtimer intervals (e.g. 1ms) are woken promptly instead
+        // of waiting up to 20ms for the absolute_timeout backstop.
+        match cpu.scheduler.earliest_blocked_timer_cntpct() {
+            Some(target) => crate::arch::timer::el2_timer_arm_at(target),
+            None => crate::arch::timer::el2_timer_rearm(),
+        }
         unsafe { core::arch::asm!("msr daifclr, #0xf") };
         aarch64_cpu::asm::wfi();
         unsafe { core::arch::asm!("msr daifset, #0xf") };
@@ -396,6 +408,10 @@ fn handle_wfi_trap(regs: &mut TrapFrame) {
         cpu.need_resched.store(true, core::sync::atomic::Ordering::Release);
     } else {
         // Other Ready vCPUs exist — block current vCPU and yield pCPU.
+        // Transition Running→Blocked here; schedule()'s slow path Blocked branch
+        // will call block_vcpu() after vcpu_switch_out() saves the hardware timer
+        // state into el1_regs. Fast path cannot fire here because rq is non-empty
+        // (else branch condition), so no_other_vcpus()=false is guaranteed.
         trace!("[WFI] vcpu={} pcpu={} → block + resched", vcpu_id, pcpu_id);
         let _ = vcpu.transition(VCpuState::Running, VCpuState::Blocked);
         arch_skip_instruction(regs);
@@ -505,6 +521,11 @@ fn handle_guest_sgi(val: u64, sgi_id: usize) {
 fn deliver_sgi_to_vcpu(vcpu: &alloc::sync::Arc<crate::vcpu::VCpu>, sgi_id: usize, cpu: &mut crate::cpu_data::PerCpu) {
     use crate::vcpu::VCpuState;
     use crate::cpu_data::PendingWake;
+
+    if vcpu.id == 1 {
+        trace!("[SGI] sgi={} -> vcpu={} state={:?} pcpu={}",
+            sgi_id, vcpu.id, vcpu.state(), cpu.id);
+    }
 
     // Target is the currently running vCPU on this pCPU — inject directly.
     if let Some(ref cur) = cpu.current_vcpu {
@@ -710,6 +731,7 @@ fn handle_psci_smc(
     match code {
         PsciFnId::PSCI_VERSION => PSCI_VERSION_1_1,
         PsciFnId::PSCI_CPU_SUSPEND_32 | PsciFnId::PSCI_CPU_SUSPEND_64 => {
+            info!("[PSCI] CPU_SUSPEND vcpu={:?} pcpu={}", this_cpu_data().current_vcpu.as_ref().map(|v| v.id), this_cpu_data().id);
             // Block the current vCPU: transition Running→Blocked, then schedule().
             // The scheduler will save context and pick the next Ready vCPU (or idle).
             // When the vCPU is woken (timer expiry / SGI), schedule() will resume it

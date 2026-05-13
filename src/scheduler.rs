@@ -188,13 +188,9 @@ impl PerCpuScheduler {
             let blocked_at = entry.blocked_at_cnt;
             let one_tick   = crate::arch::timer::tick_period_cnt();
             let timed_out  = current_cnt >= blocked_at.wrapping_add(one_tick);
-            // Absolute timeout: 2 ticks (20ms) instead of 10 (100ms).
-            // In 1:N overcommit each vCPU runs every N*tick_period, so a blocked
-            // vCPU relying on this backstop would stall for up to N*100ms before
-            // getting a chance to run — enough to trigger Linux RCU stall warnings.
-            // 2 ticks keeps the worst-case wakeup latency under 40ms (2 pCPUs * 20ms).
-            let two_ticks  = one_tick.wrapping_mul(2);
-            let absolute_timeout = current_cnt >= blocked_at.wrapping_add(two_ticks);
+            // Absolute timeout: 10 ticks (100ms), matching the old version.
+            let ten_ticks  = one_tick.wrapping_mul(10);
+            let absolute_timeout = current_cnt >= blocked_at.wrapping_add(ten_ticks);
             let no_timer_timeout = (timed_out && entry.vcpu.has_pending_irqs())
                 || absolute_timeout;
 
@@ -208,12 +204,23 @@ impl PerCpuScheduler {
                 // Don't increment i — next element shifted into position i
             } else if no_timer_timeout {
                 let entry = self.blocked_vcpus.remove(i).unwrap();
-                trace!("[WAKE-NOTIMER] vcpu={} woken after no-timer timeout", entry.vcpu.id);
+                trace!("[WAKE-NOTIMER] vcpu={} cntv_ctl={:#x} cntv_cval={:#x} pending={}",
+                    entry.vcpu.id, ctl, cval, entry.vcpu.has_pending_irqs());
                 if entry.vcpu.transition(VCpuState::Blocked, VCpuState::Ready).is_ok() {
                     self.enqueue(entry.vcpu);
                     woken += 1;
                 }
             } else {
+                // vCPU still blocked — log if waiting too long (> 5 ticks)
+                let two_ticks = one_tick.wrapping_mul(5);
+                if current_cnt >= blocked_at.wrapping_add(two_ticks) {
+                    trace!("[BLOCKED-STUCK] vcpu={} now={:#x} blocked_at={:#x} elapsed={} one_tick={} ten_ticks={} cval={:#x} ctl={:#x} cntvoff={:#x} virtual_cnt={:#x} timer_enabled={} timer_expired={}",
+                        entry.vcpu.id, current_cnt, blocked_at,
+                        current_cnt.wrapping_sub(blocked_at), one_tick,
+                        one_tick.wrapping_mul(10),
+                        cval, ctl, cntvoff, virtual_cnt,
+                        timer_enabled, timer_expired);
+                }
                 i += 1;
             }
         }
@@ -468,12 +475,19 @@ pub fn schedule() {
             VCpuState::Blocked => {
                 let actual = prev.state();
                 if actual == VCpuState::Blocked {
-                    let cntv_cval = prev.arch.el1_regs.cntv_cval_el0;
-                    let cntv_ctl  = prev.arch.el1_regs.cntv_ctl_el0;
-                    let cntvoff   = prev.arch.el1_regs.cntvoff_el2;
-                    cpu.scheduler.block_vcpu(prev.clone(), cntv_cval, cntv_ctl, cntvoff);
+                    // vcpu_switch_out() above has saved hardware timer state into
+                    // el1_regs; use those saved values for block_vcpu().
+                    // Guard with find_blocked() in case a concurrent waker already
+                    // transitioned this vCPU to Ready and enqueued it — in that
+                    // case do nothing (waker owns enqueue).
+                    if cpu.scheduler.find_blocked(prev.id).is_none() {
+                        let cntv_cval = prev.arch.el1_regs.cntv_cval_el0;
+                        let cntv_ctl  = prev.arch.el1_regs.cntv_ctl_el0;
+                        let cntvoff   = prev.arch.el1_regs.cntvoff_el2;
+                        cpu.scheduler.block_vcpu(prev.clone(), cntv_cval, cntv_ctl, cntvoff);
+                    }
                 }
-                // If already Ready (woken concurrently), waker owns enqueue — don't enqueue again.
+                // If actual==Ready (woken concurrently), waker owns enqueue — don't enqueue again.
             }
             VCpuState::Stopped => {
                 // CPU_OFF — don't re-enqueue
@@ -494,10 +508,14 @@ pub fn schedule() {
         if let Some(next_vcpu) = next_vcpu {
             let cpu = this_cpu_data();
             if next_vcpu.transition(VCpuState::Ready, VCpuState::Running).is_err() {
-                warn!("[SCH] next transition fail vcpu={} Ready->Running, retrying", next_vcpu.id);
-                continue;
+                warn!("[SCH] next transition fail vcpu={} Ready->Running actual={:?}, dropping",
+                    next_vcpu.id, next_vcpu.state());
+                // vCPU is in rq but state is not Ready — drop it and try next.
+                // Retrying with the same vCPU would loop forever if state won't change.
+                break;
             }
 
+            trace!("[SCH] pcpu={} switching to vcpu={}", cpu.id, next_vcpu.id);
             cpu.scheduler.time_slice_remaining = DEFAULT_TIME_SLICE;
             cpu.scheduler.current = Some(next_vcpu.clone());
 
@@ -524,7 +542,8 @@ fn pick_next_or_idle(prev_zone_id: Option<usize>) -> Option<Arc<VCpu>> {
         return Some(vcpu);
     }
 
-    trace!("CPU {}: entering idle loop (no Ready VCpu)", cpu.id);
+    warn!("[IDLE] pcpu={} entering el2_idle_loop rq={} blocked={}",
+        cpu.id, cpu.scheduler.len(), cpu.scheduler.blocked_vcpu_count());
     el2_idle_loop()
 }
 

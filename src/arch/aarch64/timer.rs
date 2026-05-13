@@ -118,9 +118,29 @@ pub fn el2_timer_arm_at(target_cntpct: u64) {
 /// 2. Decrement current VCPU's time slice; if expired, set `need_resched`.
 pub fn sched_tick_handler() {
     use crate::cpu_data::this_cpu_data;
-    use core::sync::atomic::Ordering;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    // Diagnostic: print tick count every 100 ticks per pCPU to confirm EL2 timer is alive.
+    static TICK_COUNT: [AtomicU64; 4] = [
+        AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0),
+    ];
 
     let cpu = this_cpu_data();
+
+    let tick_n = TICK_COUNT[cpu.id.min(3)].fetch_add(1, Ordering::Relaxed);
+    if tick_n % 10000 == 0 {
+        info!(
+            "[TICK] pcpu={} tick={} vcpu={:?} sched_cur={:?} rq={} blocked={} slice={}",
+            cpu.id,
+            tick_n,
+            cpu.current_vcpu.as_ref().map(|v| v.id),
+            cpu.scheduler.current.as_ref().map(|v| v.id),
+            cpu.scheduler.len(),
+            cpu.scheduler.blocked_vcpu_count(),
+            cpu.scheduler.time_slice_remaining,
+        );
+    }
 
     let current_cnt = read_sysreg!(CNTPCT_EL0);
 
