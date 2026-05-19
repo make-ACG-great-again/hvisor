@@ -183,6 +183,7 @@ fn is_same_zone(vcpu_id: usize) -> bool {
 /// Handle SGI/PPI register access via the per-vCPU virtual GICR shadow state.
 /// Called when the target vCPU is not currently running on its bound pCPU,
 /// or to keep shadow in sync when it is running.
+
 fn vgicr_shadow_access(mmio: &mut MMIOAccess, vcpu_id: usize, reg: usize) {
     let zone = this_zone();
     let zone_lock = zone.read();
@@ -204,8 +205,14 @@ fn vgicr_shadow_access(mmio: &mut MMIOAccess, vcpu_id: usize, reg: usize) {
 
     match reg {
         r if r == GICR_SGI_BASE + GICR_IGROUPR => {
-            if mmio.is_write { vgicr.igroupr = mmio.value as u32; }
-            else { mmio.value = vgicr.igroupr as usize; }
+            if mmio.is_write {
+                // Keep IRQ 26 (EL2 physical timer) in Group 1 regardless of
+                // what the guest writes. Linux sets IGROUPR0=0 during init
+                // which would move IRQ 26 to Group 0 and prevent delivery.
+                vgicr.igroupr = (mmio.value as u32) | (1 << 26);
+            } else {
+                mmio.value = vgicr.igroupr as usize;
+            }
         }
         r if r == GICR_SGI_BASE + GICR_ISENABLER => {
             if mmio.is_write { vgicr.isenabler |= mmio.value as u32; }
@@ -394,8 +401,32 @@ pub fn vgicv3_redist_handler(mmio: &mut MMIOAccess, vcpu_id: usize) -> HvResult 
             drop(zone_lock);
 
             if is_current_on_pcpu {
-                // vCPU is running — sync shadow then write hardware.
+                // vCPU is running — update shadow first (applies all filters,
+                // e.g. IGROUPR forces bit 26=1), then forward the filtered
+                // value to hardware so the physical GICR matches the shadow.
+                // Doing it this way ensures hvisor-owned PPIs are never
+                // disturbed by guest writes even while the vCPU is live.
                 vgicr_shadow_access(mmio, vcpu_id, reg);
+                // For write accesses, forward the filtered value to hardware.
+                // IGROUPR: read shadow (has IRQ26 bit forced) back into mmio.value.
+                // ICENABLER: mmio.value is already filtered (bit26/25/IPI cleared above).
+                // ISENABLER: mmio.value is the guest's set-bits; shadow OR'd bit26 in,
+                //   read back so we also set bit26 in hardware if shadow added it.
+                // Other regs: read back shadow to avoid forwarding partially-wrong values.
+                if mmio.is_write && reg != GICR_SGI_BASE + GICR_ICENABLER {
+                    mmio.is_write = false;
+                    vgicr_shadow_access(mmio, vcpu_id, reg); // shadow → mmio.value
+                    mmio.is_write = true;
+                }
+                // For ICENABLER writes: filter out hypervisor-owned IRQs so
+                // guest cannot disable the EL2 timer (26), GIC maintenance (25),
+                // or the hypervisor IPI SGI.
+                if mmio.is_write && reg == GICR_SGI_BASE + GICR_ICENABLER {
+                    // Prevent guest from disabling hypervisor-owned PPIs/SGIs:
+                    // IRQ 26 (CNTHP, EL2 physical timer), IRQ 25 (maintenance), SGI_IPI_ID.
+                    let hv_mask = (1u32 << 26) | (1u32 << MAINTENACE_INTERRUPT) | (1u32 << SGI_IPI_ID);
+                    mmio.value &= !(hv_mask as usize);
+                }
                 mmio_perform_access(gicr_base, mmio);
             } else {
                 // vCPU not running — shadow only, do not touch hardware.

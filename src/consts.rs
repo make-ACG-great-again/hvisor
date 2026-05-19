@@ -28,7 +28,7 @@ use crate::{memory::addr::VirtAddr, platform::BOARD_NCPUS};
 use core::arch::global_asm;
 
 /// Size of the hypervisor heap.
-pub const HV_HEAP_SIZE: usize = 1024 * 1024; // 1 MiB
+pub const HV_HEAP_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
 
 /// Size of the hypervisor memory pool used for dynamic allocation.
 pub const HV_MEM_POOL_SIZE: usize = 64 * 1024 * 1024; // 64 MiB

@@ -30,7 +30,7 @@ pub const IPI_EVENT_WAKEUP: usize = 0;
 pub const IPI_EVENT_SHUTDOWN: usize = 1;
 pub const IPI_EVENT_VIRTIO_INJECT_IRQ: usize = 2;
 pub const IPI_EVENT_WAKEUP_VIRTIO_DEVICE: usize = 3;
-/// Tell target pCPU to call drain_pending_wake_ids() + schedule().
+/// Tell target pCPU to wake blocked vCPUs with pending IRQs + schedule().
 pub const IPI_EVENT_RESCHED: usize = 7;
 /// New vCPU arrived in incoming_vcpus queue; drain and schedule.
 pub const IPI_EVENT_INCOMING_VCPU: usize = 8;
@@ -119,12 +119,15 @@ pub fn check_events() -> bool {
             cpu_data.arch_cpu.idle();
         }
         Some(IPI_EVENT_RESCHED) => {
-            crate::vcpu::drain_pending_wake_ids();
+            // Wake any locally-blocked vCPUs that now have pending IRQs.
+            // Senders push IRQ directly into pending_virqs (Mutex-safe cross-pCPU),
+            // then send this IPI so we can do the scheduler-local transition+enqueue.
+            let woken = cpu_data.scheduler.drain_pending_irq_wakeups();
             #[cfg(target_arch = "aarch64")]
             {
-                // stack_regs_ptr is unavailable here (we're in IPI context, not a trap frame).
-                // The actual schedule() call will happen at the next arch_handle_exit check.
-                cpu_data.need_resched.store(true, core::sync::atomic::Ordering::Release);
+                if woken > 0 {
+                    cpu_data.need_resched.store(true, core::sync::atomic::Ordering::Release);
+                }
             }
             true
         }

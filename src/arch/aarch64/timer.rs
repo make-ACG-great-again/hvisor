@@ -120,7 +120,6 @@ pub fn sched_tick_handler() {
     use crate::cpu_data::this_cpu_data;
     use core::sync::atomic::{AtomicU64, Ordering};
 
-    // Diagnostic: print tick count every 100 ticks per pCPU to confirm EL2 timer is alive.
     static TICK_COUNT: [AtomicU64; 4] = [
         AtomicU64::new(0), AtomicU64::new(0),
         AtomicU64::new(0), AtomicU64::new(0),
@@ -130,15 +129,35 @@ pub fn sched_tick_handler() {
 
     let tick_n = TICK_COUNT[cpu.id.min(3)].fetch_add(1, Ordering::Relaxed);
     if tick_n % 10000 == 0 {
+        let rq_states: alloc::vec::Vec<(usize, crate::vcpu::VCpuState)> = {
+            let mut v = alloc::vec::Vec::new();
+            for prio in 0..crate::scheduler::NUM_PRIORITIES {
+                for vcpu in cpu.scheduler.run_queue_iter(prio) {
+                    v.push((vcpu.id, vcpu.state()));
+                }
+            }
+            v
+        };
+        let cur_elr = cpu.scheduler.current.as_ref().map(|v| v.arch.trapframe().elr);
+        let cnthp_ctl = read_sysreg!(CNTHP_CTL_EL2);
+        let hcr_el2 = read_sysreg!(HCR_EL2);
+        let sched_calls = crate::scheduler::SCHEDULE_CALL_COUNTER.load(core::sync::atomic::Ordering::Relaxed);
         info!(
-            "[TICK] pcpu={} tick={} vcpu={:?} sched_cur={:?} rq={} blocked={} slice={}",
+            "[TICK] pcpu={} tick={} sched_calls={} vcpu={:?} sched_cur={:?} rq={} blocked={} slice={} need_resched={} vcpu_state={:?} rq_states={:?} cur_elr={:?} cnthp_ctl={:#x} hcr={:#x}",
             cpu.id,
             tick_n,
+            sched_calls,
             cpu.current_vcpu.as_ref().map(|v| v.id),
             cpu.scheduler.current.as_ref().map(|v| v.id),
             cpu.scheduler.len(),
             cpu.scheduler.blocked_vcpu_count(),
             cpu.scheduler.time_slice_remaining,
+            cpu.need_resched.load(core::sync::atomic::Ordering::Relaxed),
+            cpu.scheduler.current.as_ref().map(|v| v.state()),
+            rq_states,
+            cur_elr,
+            cnthp_ctl,
+            hcr_el2,
         );
     }
 
@@ -151,7 +170,6 @@ pub fn sched_tick_handler() {
         cpu.need_resched.store(true, Ordering::Release);
         trace!("[TICK] pcpu={} woke {} blocked vcpus (was {})", cpu.id, woken, blocked_before);
     } else if blocked_before > 0 {
-        // Blocked vCPUs exist but none woken — log first entry for diagnosis
         if let Some((cval, ctl, cntvoff, blocked_at)) = cpu.scheduler.first_blocked_timer_info() {
             let virtual_cnt = current_cnt.wrapping_sub(cntvoff);
             trace!("[TICK] pcpu={} {} blocked vcpu(s) not woken: cval={:#x} virt_cnt={:#x} ctl={:#x} blocked_at={:#x} now={:#x}",
@@ -163,25 +181,11 @@ pub fn sched_tick_handler() {
     cpu.scheduler.check_ready_timers(current_cnt);
 
     // Step 3: Check the currently running vCPU's hardware CNTV ISTATUS.
-    //
-    // When restore_to_hardware sets IMASK=1 on an already-expired CNTV, the physical
-    // IRQ 27 signal is suppressed. The running vCPU will never receive IRQ 27 via the
-    // hardware EL1-IRQ path. We must inject it here via the software (HW=0) LR path.
-    //
-    // IMPORTANT: only inject when IMASK=1. If IMASK=0, the physical IRQ 27 is already
-    // unmasked and will arrive via the normal EL1-IRQ path as HW=1. Injecting HW=0
-    // on top of a pending HW=1 creates a conflict: guest EOI clears the virtual side
-    // but leaves the physical Active state set, causing an IRQ 27 storm.
     {
         let cntv_ctl: u64 = read_sysreg!(CNTV_CTL_EL0);
         let timer_enabled = (cntv_ctl & 1) != 0;
-        let timer_masked  = (cntv_ctl & 2) != 0; // IMASK: set by restore_to_hardware
-        let timer_expired = (cntv_ctl & 4) != 0; // ISTATUS bit
-        // Only proxy IRQ 27 when IMASK=1 suppresses the physical delivery.
-        // Push to pending_virqs rather than calling inject_irq() directly:
-        // vcpu_vmreturn() is the single inject point and also sets IMASK=1 before
-        // writing the HW=0 LR, preventing the physical IRQ 27 from re-firing
-        // before the guest consumes the LR (which caused the Pending-conflict warns).
+        let timer_masked  = (cntv_ctl & 2) != 0;
+        let timer_expired = (cntv_ctl & 4) != 0;
         if timer_enabled && timer_masked && timer_expired {
             if let Some(ref vcpu) = cpu.scheduler.current {
                 vcpu.push_pending_irq(27, false);
@@ -201,6 +205,13 @@ pub fn sched_tick_handler() {
 
     if cpu.scheduler.time_slice_remaining == 0 {
         cpu.need_resched.store(true, Ordering::Release);
+        use core::sync::atomic::AtomicU64;
+        static RESCHED_SET_COUNT: AtomicU64 = AtomicU64::new(0);
+        let m = RESCHED_SET_COUNT.fetch_add(1, Ordering::Relaxed);
+        if m % 10000 == 0 {
+            info!("[TICK-RESCHED] #{} sched_calls={}", m,
+                crate::scheduler::SCHEDULE_CALL_COUNTER.load(Ordering::Relaxed));
+        }
     }
 
     el2_timer_rearm();

@@ -92,7 +92,25 @@ static TIMER_INTERRUPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 const TIMER_INTERRUPT_PRINT_INTERVAL: u64 = 50;
 
 pub fn gicv3_handle_irq_el1() {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static GIC_ENTRY_COUNT: AtomicU64 = AtomicU64::new(0);
+    let gic_n = GIC_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed);
+    if gic_n % 10000 == 0 {
+        info!("[GIC-EL1] enter #{}", gic_n);
+    }
+    let mut irq26_count = 0u32;
+    let mut irq27_count = 0u32;
+    let mut other_count = 0u32;
+    let mut loop_iter = 0u32;
+    static LOOP_LOG: AtomicU64 = AtomicU64::new(0);
     while let Some(irq_id) = pending_irq() {
+        loop_iter += 1;
+        {
+            let n = LOOP_LOG.fetch_add(1, Ordering::Relaxed);
+            if n % 5000 == 0 {
+                info!("[GIC-LOOP] #{} gic_n={} iter={} irq={}", n, gic_n, loop_iter, irq_id);
+            }
+        }
         if irq_id < 8 {
             trace!("sgi get {}, try to handle...", irq_id);
             deactivate_irq(irq_id);
@@ -111,11 +129,20 @@ pub fn gicv3_handle_irq_el1() {
             if irq_id == 26 {
                 // EL2 physical timer (CNTHP) — scheduling tick, private to hypervisor.
                 // Must NOT be injected into the guest.
-                deactivate_irq(irq_id);
+                irq26_count += 1;
                 #[cfg(target_arch = "aarch64")]
-                crate::arch::timer::sched_tick_handler();
+                {
+                    use core::sync::atomic::{AtomicU64, Ordering};
+                    static TICK_CALL: AtomicU64 = AtomicU64::new(0);
+                    let t = TICK_CALL.fetch_add(1, Ordering::Relaxed);
+                    if t % 10000 == 0 { info!("[TICK-CALL] before #{}", t); }
+                    crate::arch::timer::sched_tick_handler();
+                    if t % 10000 == 0 { info!("[TICK-CALL] after #{}", t); }
+                }
+                deactivate_irq(irq_id);
                 continue;
             } else if irq_id == 27 {
+                irq27_count += 1;
                 // virtual timer interrupt
                 TIMER_INTERRUPT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
                 if TIMER_INTERRUPT_COUNTER.load(core::sync::atomic::Ordering::SeqCst)
@@ -128,116 +155,45 @@ pub fn gicv3_handle_irq_el1() {
                     );
                 }
             } else if irq_id == 25 {
+                other_count += 1;
                 // maintenace interrupt
                 handle_maintenace_interrupt();
             } else if irq_id > 31 {
+                other_count += 1;
                 //inject phy irq
                 trace!("*** get spi_irq id = {}", irq_id);
             } else {
+                other_count += 1;
                 warn!("not konw irq id = {}", irq_id);
             }
-            // Snapshot LR state before inject_irq modifies it.
-            // We need to detect the HW=0 conflict case: a software-injected LR.HW=0
-            // entry already exists for this irq_id when a physical (HW=1) IRQ arrives.
-            // In that case the physical IRQ stays Active after EOIR (EOImode=1), because
-            // we relied on LR.HW=1 + guest EOI to deactivate it — but the LR is HW=0.
-            // We must write DIR after EOIR (EOIR must precede DIR per GICv3 spec).
-            let hw0_conflict = if is_hardware_irq(irq_id) {
-                find_lr_hw0(irq_id)
-            } else {
-                Hw0Conflict::None
-            };
-
             let lr_written = if irq_id != 25 {
                 schedule_inject_irq(irq_id, true)
             } else {
                 true
             };
-            // EOIR first (priority drop), then DIR (deactivate) — order required by spec.
+            // EOImode=1: EOIR only drops priority, DIR deactivates.
+            // Always EOIR first (priority drop), then DIR if needed.
             deactivate_irq(irq_id);
-            // Write DIR when physical Active state won't be cleared by guest EOI:
-            // 1. lr_written=false: LR not written (all full), physical stays Active.
-            // 2. hw0_conflict: LR has HW=0 entry, guest EOI won't deactivate physical.
-            // In both cases: EOIR already done above, now safe to DIR.
+            // IRQ 27: if LR.HW=1 was written (lr_written=true), guest EOIR will
+            // hardware-deactivate the physical IRQ automatically (VEOIM=0).
+            // Physical IRQ stays Active until guest EOI — this prevents CNTV from
+            // re-asserting Pending while we are still in the EL2 handler loop.
+            // If no LR was written (lr_written=false), write DIR now to prevent
+            // physical IRQ 27 staying permanently Active → RCU stall.
             if irq_id == 27 && !lr_written {
                 write_sysreg!(icc_dir_el1, 27u64);
-                // IRQ 27 (CNTV) is level-triggered: if ISTATUS=1 and IMASK=0, it becomes
-                // Pending again immediately after DIR. With no current vCPU (e.g. idle pCPU
-                // after zone shutdown), this causes an infinite IRQ-27 delivery loop.
-                // Set IMASK=1 to suppress hardware delivery. The IRQ will be re-delivered
-                // when a vCPU is scheduled in and restore_to_hardware clears IMASK (or
-                // sched_tick_handler Step 3 injects it via the software path).
-                #[cfg(target_arch = "aarch64")]
-                {
-                    let cntv_ctl = read_sysreg!(CNTV_CTL_EL0);
-                    if (cntv_ctl & 1) != 0 {
-                        write_sysreg!(CNTV_CTL_EL0, cntv_ctl | 2); // set IMASK
-                    }
-                }
-            }
-            match hw0_conflict {
-                Hw0Conflict::None => {}
-                Hw0Conflict::Active => {
-                    // Guest is mid-handler for a HW=0 IRQ 27 (normal in 1:N overcommit:
-                    // physical timer fired again while guest was handling the previous one).
-                    // DIR deactivates the physical Active state; guest EOI handles the virtual.
-                    write_sysreg!(icc_dir_el1, irq_id as u64);
-                    trace!("irq {} HW=0 Active conflict (1:N normal): wrote DIR", irq_id);
-                }
-                Hw0Conflict::Pending => {
-                    // Guest hasn't accepted the HW=0 LR yet. Physical IRQ arrived on top.
-                    // DIR to clear physical Active state. This shouldn't happen if
-                    // vcpu_switch_out correctly retracts pending HW=0 LR entries.
-                    write_sysreg!(icc_dir_el1, irq_id as u64);
-                    warn!("irq {} HW=0 Pending conflict: wrote DIR (check vcpu_switch_out retract logic)", irq_id);
-                }
             }
         }
     }
-    trace!("handle done")
-}
-
-/// Returns true if irq_id is a hardware-mapped IRQ (PPI or SPI, not SGI).
-/// SGIs (0-15) are always software-only; PPIs (16-31) and SPIs (32+) are hardware.
-fn is_hardware_irq(irq_id: usize) -> bool {
-    irq_id >= 16
-}
-
-/// LR conflict descriptor: distinguishes Pending-only from Active HW=0 entries.
-/// Only a Pending HW=0 entry is a true conflict (guest hasn't accepted the IRQ yet,
-/// but physical Active state won't be cleared by guest EOI).
-/// An Active HW=0 entry means the guest is mid-handler — DIR is still needed, but
-/// this is a normal 1:N overcommit situation, not a bug.
-#[derive(PartialEq)]
-enum Hw0Conflict {
-    None,
-    /// LR state = Pending or Active+Pending — guest hasn't accepted yet
-    Pending,
-    /// LR state = Active only — guest is mid-handler
-    Active,
-}
-
-fn find_lr_hw0(irq_id: usize) -> Hw0Conflict {
-    const LR_VIRTIRQ_MASK: usize = (1 << 32) - 1;
-    let vtr = read_sysreg!(ich_vtr_el2) as usize;
-    let lr_num = (vtr & 0xf) + 1;
-    let elsr: u64 = read_sysreg!(ich_elrsr_el2);
-    for i in 0..lr_num {
-        if (elsr >> i) & 1 == 1 {
-            continue; // LR is free/empty
-        }
-        let lr_val = read_lr(i) as usize;
-        if (lr_val & LR_VIRTIRQ_MASK) == irq_id && (lr_val & (1 << 61)) == 0 {
-            // bits[63:62]: 01=Pending, 10=Active, 11=Active+Pending
-            let state = (lr_val >> 62) & 0x3;
-            if state & 0x1 != 0 {
-                return Hw0Conflict::Pending; // Pending or Active+Pending
-            } else {
-                return Hw0Conflict::Active; // Active only
-            }
-        }
+    // Log IRQ counts if anything unusual (irq26 > 1, or total > 3).
+    let total = irq26_count + irq27_count + other_count;
+    if gic_n % 10000 == 0 || loop_iter > 5 {
+        info!("[GIC-EL1] exit #{} iters={} irq26={} irq27={} other={}", gic_n, loop_iter, irq26_count, irq27_count, other_count);
     }
-    Hw0Conflict::None
+    if irq26_count > 1 || total > 3 {
+        warn!("[IRQ-STAT] #{} irq26={} irq27={} other={} total={}",
+            gic_n, irq26_count, irq27_count, other_count, total);
+    }
 }
 
 fn pending_irq() -> Option<usize> {
@@ -372,11 +328,11 @@ fn handle_maintenace_interrupt() {
 ///     writes) to find the intended vCPU. If the target is the current vCPU,
 ///     inject directly. If it is a different vCPU (Blocked/Ready on the same
 ///     pCPU), push to that vCPU's pending queue and wake it. If it lives on
-///     another pCPU, push a PendingWake and send IPI_EVENT_RESCHED.
+///     another pCPU, push IRQ into pending_virqs and send IPI_EVENT_RESCHED.
 ///
 /// Returns true if an LR entry was written (caller may skip DIR for HW IRQs).
 pub fn schedule_inject_irq(irq_id: usize, is_hardware: bool) -> bool {
-    use crate::cpu_data::{get_cpu_data, this_cpu_data, PendingWake};
+    use crate::cpu_data::{get_cpu_data, this_cpu_data};
     use crate::vcpu::VCpuState;
 
     let cpu = this_cpu_data();
@@ -412,16 +368,10 @@ pub fn schedule_inject_irq(irq_id: usize, is_hardware: bool) -> bool {
                                 }
                             }
                         } else {
-                            // Cross-pCPU: push PendingWake and send IPI_EVENT_RESCHED.
-                            let target_cpu_data = get_cpu_data(target_pcpu);
-                            target_cpu_data
-                                .pending_wake_ids
-                                .lock()
-                                .push_back(PendingWake {
-                                    vcpu_id: target_vcpu_id,
-                                    irq_id,
-                                    is_hardware,
-                                });
+                            // Cross-pCPU: push IRQ directly into vCPU's Mutex-protected
+                            // pending_virqs, then IPI_EVENT_RESCHED so the target pCPU
+                            // wakes the vCPU from its blocked_vcpus list.
+                            target_vcpu.push_pending_irq(irq_id, is_hardware);
                             crate::event::send_event(
                                 target_pcpu,
                                 crate::hypercall::SGI_IPI_ID as _,

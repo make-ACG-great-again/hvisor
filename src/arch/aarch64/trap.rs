@@ -45,7 +45,28 @@ global_asm!(
 /// Processes the interrupt via GIC and returns — trap.S then eret back to EL2 code.
 /// Must NOT call vmreturn or schedule.
 #[no_mangle]
+pub static EL2_IRQ_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static EL1_IRQ_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Called from _el2_irq_handler in trap.S (EL2 WFI / EL2 context only).
+///
+/// This handler is reached only when the IRQ interrupted EL2 code (SPSR_EL2.M = EL2h).
+/// When an IRQ interrupts EL1 (guest), trap.S routes it directly to arch_handle_exit
+/// as EXIT_REASON_EL1_IRQ, so schedule() runs there in the normal vmexit path.
+#[no_mangle]
 extern "C" fn el2_irq_handler() {
+    use core::sync::atomic::Ordering;
+    let n = EL2_IRQ_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if n % 10000 == 0 {
+        use crate::arch::sysreg::read_sysreg;
+        let elr = read_sysreg!(ELR_EL2);
+        let spsr = read_sysreg!(SPSR_EL2);
+        let sp: u64;
+        unsafe { core::arch::asm!("mov {}, sp", out(reg) sp, options(nostack, preserves_flags)) };
+        let cur = crate::cpu_data::this_cpu_data().scheduler.current.as_ref().map(|v| v.id);
+        let sched_calls = crate::scheduler::SCHEDULE_CALL_COUNTER.load(Ordering::Relaxed);
+        info!("[EL2-IRQ] #{} elr={:#x} spsr={:#x} sp={:#x} sched_cur={:?} sched_calls={}", n, elr, spsr, sp, cur, sched_calls);
+    }
     crate::device::irqchip::gic_handle_irq();
 }
 
@@ -129,7 +150,15 @@ pub fn arch_handle_exit(regs: &mut TrapFrame, exit_reason: u64) -> ! {
 
     match exit_reason {
         ExceptionType::EXIT_REASON_EL1_IRQ | ExceptionType::EXIT_REASON_EL1_AARCH32_IRQ => {
-            irqchip_handle_irq1()
+            irqchip_handle_irq1();
+            {
+                use core::sync::atomic::{AtomicU64, Ordering};
+                static AHE_GIC_RET: AtomicU64 = AtomicU64::new(0);
+                let n = AHE_GIC_RET.fetch_add(1, Ordering::Relaxed);
+                if n % 10000 == 0 {
+                    info!("[AHE-GIC-RET] #{} gic returned ok", n);
+                }
+            }
         }
         ExceptionType::EXIT_REASON_EL1_ABORT | ExceptionType::EXIT_REASON_EL1_AARCH32_ABORT => {
             arch_handle_trap_el1(regs)
@@ -150,6 +179,17 @@ pub fn arch_handle_exit(regs: &mut TrapFrame, exit_reason: u64) -> ! {
     }
 
     let cpu = this_cpu_data();
+    {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static AHE_COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = AHE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n % 10000 == 0 {
+            info!("[AHE] #{} exit_reason={} need_resched={} sched_calls={}",
+                n, exit_reason,
+                cpu.need_resched.load(Ordering::Relaxed),
+                crate::scheduler::SCHEDULE_CALL_COUNTER.load(Ordering::Relaxed));
+        }
+    }
     if cpu.need_resched.load(core::sync::atomic::Ordering::Acquire) {
         crate::scheduler::schedule();
     }
@@ -173,9 +213,25 @@ pub fn arch_handle_exit(regs: &mut TrapFrame, exit_reason: u64) -> ! {
 ///
 /// If current_vcpu is None (e.g. after IPI_EVENT_ZONE_SHUTDOWN cleared it),
 /// re-enter the scheduler (el2_idle_loop) instead.
+pub static VMRETURN_CALL_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 fn vcpu_vmreturn() -> ! {
     use crate::arch::sysreg::{read_sysreg, write_sysreg};
+    use core::sync::atomic::Ordering;
+    static VVR_ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let vvr_n = VVR_ENTRY.fetch_add(1, Ordering::Relaxed);
+    if vvr_n % 10000 == 0 {
+        info!("[VVR] #{} entered vcpu_vmreturn sched_calls={}", vvr_n,
+            crate::scheduler::SCHEDULE_CALL_COUNTER.load(Ordering::Relaxed));
+    }
     loop {
+        let loop_n = VMRETURN_CALL_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if loop_n % 10000 == 0 {
+            let cpu = this_cpu_data();
+            info!("[VVR-LOOP] #{} current_vcpu={:?} sched_calls={}", loop_n,
+                cpu.current_vcpu.as_ref().map(|v| v.id),
+                crate::scheduler::SCHEDULE_CALL_COUNTER.load(Ordering::Relaxed));
+        }
         if let Some(ref vcpu) = this_cpu_data().current_vcpu {
             // Compute once: will physical IRQ 27 arrive naturally (HW=1)?
             let irq27_will_arrive_physically = {
@@ -212,10 +268,27 @@ fn vcpu_vmreturn() -> ! {
             }
 
             let trapframe_ptr = vcpu.arch.trapframe_ptr();
+            {
+                use core::sync::atomic::{AtomicU64, Ordering};
+                static VMRET_COUNT: AtomicU64 = AtomicU64::new(0);
+                let n = VMRET_COUNT.fetch_add(1, Ordering::Relaxed);
+                {
+                    let tf = vcpu.arch.trapframe();
+                    if n % 10000 == 0 {
+                        info!("[VMRET] #{} vcpu={} elr={:#x} spsr={:#x}",
+                            n, vcpu.id, tf.elr, tf.spsr);
+                    }
+                }
+            }
+            // Update TPIDR_EL2 so _el2h_irq_entry knows a guest is running in EL1.
+            // The value (trapframe_ptr) is also used as SP in the EL1-from-IRQ path.
+            write_sysreg!(TPIDR_EL2, trapframe_ptr as u64);
             unsafe { vmreturn(trapframe_ptr) }
         } else {
             // No current vCPU — re-enter scheduler (el2_idle_loop).
             // This happens after IPI_EVENT_ZONE_SHUTDOWN clears current_vcpu.
+            warn!("[VVR-ELSE] current_vcpu=None, calling schedule() sched_calls={}",
+                crate::scheduler::SCHEDULE_CALL_COUNTER.load(core::sync::atomic::Ordering::Relaxed));
             crate::scheduler::schedule();
             // schedule() picked a new vCPU: loop back to drain+vmreturn it.
         }
@@ -223,7 +296,11 @@ fn vcpu_vmreturn() -> ! {
 }
 
 fn irqchip_handle_irq1() {
-    trace!("irq from el1");
+    use core::sync::atomic::Ordering;
+    let n = EL1_IRQ_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if n % 10000 == 0 && n > 0 {
+        trace!("[EL1-IRQ] irqchip_handle_irq1 called {} times (EL1 exit)", n);
+    }
     gic_handle_irq();
 }
 
@@ -351,12 +428,21 @@ fn handle_wfi_trap(regs: &mut TrapFrame) {
         return;
     }
 
-    let has_blocked = cpu.scheduler.has_blocked_vcpus();
-    let rq_empty    = cpu.scheduler.is_empty();
     let truly_alone = cpu.scheduler.no_other_vcpus();
 
     let vcpu_id = vcpu.id;
     let pcpu_id = cpu.id;
+
+    {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static WFI_COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = WFI_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n % 10000 == 0 {
+            info!("[WFI] #{} vcpu={} truly_alone={} rq={} blocked={}",
+                n, vcpu_id, truly_alone,
+                cpu.scheduler.len(), cpu.scheduler.blocked_vcpu_count());
+        }
+    }
 
     let cntv_ctl: u64 = read_sysreg!(CNTV_CTL_EL0);
     let timer_already_expired = (cntv_ctl & 0x5) == 0x5; // ENABLE=1, ISTATUS=1
@@ -388,30 +474,12 @@ fn handle_wfi_trap(regs: &mut TrapFrame) {
             cpu.need_resched.store(true, core::sync::atomic::Ordering::Release);
         }
         arch_skip_instruction(regs);
-    } else if rq_empty && has_blocked {
-        // Blocked vCPUs exist but runqueue is empty. Do NOT block self — deadlock.
-        // Do real EL2 WFI so pCPU stays responsive. Advance PC first.
-        arch_skip_instruction(regs);
-        drop(vcpu);
-        // Arm timer precisely at the earliest blocked vCPU's virtual timer expiry
-        // rather than a fixed 10ms tick. This ensures blocked vCPUs relying on
-        // short nanosleep/hrtimer intervals (e.g. 1ms) are woken promptly instead
-        // of waiting up to 20ms for the absolute_timeout backstop.
-        match cpu.scheduler.earliest_blocked_timer_cntpct() {
-            Some(target) => crate::arch::timer::el2_timer_arm_at(target),
-            None => crate::arch::timer::el2_timer_rearm(),
-        }
-        unsafe { core::arch::asm!("msr daifclr, #0xf") };
-        aarch64_cpu::asm::wfi();
-        unsafe { core::arch::asm!("msr daifset, #0xf") };
-        crate::vcpu::drain_incoming_vcpus();
-        cpu.need_resched.store(true, core::sync::atomic::Ordering::Release);
     } else {
-        // Other Ready vCPUs exist — block current vCPU and yield pCPU.
-        // Transition Running→Blocked here; schedule()'s slow path Blocked branch
-        // will call block_vcpu() after vcpu_switch_out() saves the hardware timer
-        // state into el1_regs. Fast path cannot fire here because rq is non-empty
-        // (else branch condition), so no_other_vcpus()=false is guaranteed.
+        // Other vCPUs exist (Ready or Blocked) — block self and yield pCPU.
+        // schedule()'s slow path will call block_vcpu() after vcpu_switch_out()
+        // saves hardware timer state. If rq is empty after blocking, schedule()
+        // enters el2_idle_loop() which does real EL2 WFI until a blocked vCPU's
+        // timer fires or a cross-pCPU SGI arrives.
         trace!("[WFI] vcpu={} pcpu={} → block + resched", vcpu_id, pcpu_id);
         let _ = vcpu.transition(VCpuState::Running, VCpuState::Blocked);
         arch_skip_instruction(regs);
@@ -520,7 +588,6 @@ fn handle_guest_sgi(val: u64, sgi_id: usize) {
 
 fn deliver_sgi_to_vcpu(vcpu: &alloc::sync::Arc<crate::vcpu::VCpu>, sgi_id: usize, cpu: &mut crate::cpu_data::PerCpu) {
     use crate::vcpu::VCpuState;
-    use crate::cpu_data::PendingWake;
 
     if vcpu.id == 1 {
         trace!("[SGI] sgi={} -> vcpu={} state={:?} pcpu={}",
@@ -550,11 +617,9 @@ fn deliver_sgi_to_vcpu(vcpu: &alloc::sync::Arc<crate::vcpu::VCpu>, sgi_id: usize
                 }
                 cpu.need_resched.store(true, core::sync::atomic::Ordering::Release);
             } else {
-                // Cross-pCPU: push to target's pending_wake_ids, send IPI_EVENT_RESCHED.
-                // The target pCPU's handler injects the IRQ and enqueues the vCPU.
-                crate::cpu_data::get_cpu_data(target_pcpu)
-                    .pending_wake_ids.lock()
-                    .push_back(PendingWake { vcpu_id: vcpu.id, irq_id: sgi_id, is_hardware: false });
+                // Cross-pCPU: push IRQ directly into the vCPU's Mutex-protected pending_virqs,
+                // then send IPI_EVENT_RESCHED so the target pCPU wakes the vCPU from blocked_vcpus.
+                vcpu.push_pending_irq(sgi_id, false);
                 crate::event::send_event(target_pcpu, crate::hypercall::SGI_IPI_ID as _, crate::event::IPI_EVENT_RESCHED);
             }
         }

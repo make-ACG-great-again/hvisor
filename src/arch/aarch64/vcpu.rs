@@ -149,15 +149,17 @@ impl El1SysRegs {
         //   ISTATUS=0 the guest has handled the interrupt, so we restore IMASK=0.
         let cntv_ctl = read_sysreg!(CNTV_CTL_EL0);
         let timer_enabled = (cntv_ctl & 1) != 0;
-        let timer_expired = (cntv_ctl & 4) != 0; // ISTATUS
-        if timer_enabled && timer_expired {
+        if timer_enabled {
+            // Always mask hardware CNTV delivery while this vCPU is off-CPU.
+            // Even if ISTATUS=0 now, the counter keeps running and the timer may
+            // expire before this vCPU is scheduled back in, which would fire a
+            // spurious physical IRQ 27 with no vCPU to receive it.
+            // Timer expiry is checked by check_blocked_timers() via CNTPCT comparison.
             let masked = cntv_ctl | 2; // set IMASK
-            write_sysreg!(CNTV_CTL_EL0, masked); // suppress physical IRQ 27 immediately
+            write_sysreg!(CNTV_CTL_EL0, masked);
             self.cntv_ctl_el0 = masked;
         } else {
-            // Clear IMASK — hypervisor may have set it temporarily, but ISTATUS=0 means
-            // the guest has handled the interrupt (or it hasn't fired yet).
-            self.cntv_ctl_el0 = cntv_ctl & !2u64; // clear IMASK
+            self.cntv_ctl_el0 = cntv_ctl;
         }
         self.cntkctl_el1    = read_sysreg!(CNTKCTL_EL1);
     }
@@ -547,20 +549,43 @@ pub fn restore_vgicr(vcpu: &crate::vcpu::VCpu) {
     let pcpu_id = vcpu.get_pcpu_affinity();
     let sgi_base = host_gicr_base(pcpu_id) + gicr::GICR_SGI_BASE;
     let vgicr = unsafe { &*vcpu.arch.gic_state.vgicr.get() };
+    // Always ensure IRQ 26 (CNTHP, EL2 physical timer) is enabled on this
+    // pCPU's GICR regardless of whether the vCPU has initialized its shadow.
+    unsafe {
+        let isenabler_ptr = (sgi_base + gicr::GICR_ISENABLER) as *mut u32;
+        isenabler_ptr.write_volatile(1u32 << 26);
+        let ipriorityr26 = (sgi_base + gicr::GICR_IPRIORITYR + 26) as *mut u8;
+        ipriorityr26.write_volatile(0xa0);
+    }
+
     if !vgicr.initialized {
         return;
     }
     unsafe {
+        use crate::hypercall::SGI_IPI_ID;
+        use crate::device::irqchip::gicv3::MAINTENACE_INTERRUPT;
+
+        // Restore IGROUPR (guest-controlled; IRQ 26 group is managed by Secure firmware).
         let igroupr = (sgi_base + gicr::GICR_IGROUPR) as *mut u32;
         igroupr.write_volatile(vgicr.igroupr);
 
+        // Clear all guest-controlled PPI enables first, preserving hypervisor IRQs.
+        // IRQ 26 (EL2 physical timer), IRQ 25 (maintenance), SGI_IPI_ID are preserved.
+        let hv_mask: u32 = (1u32 << 26) | (1u32 << MAINTENACE_INTERRUPT) | (1u32 << SGI_IPI_ID);
+        let icenabler = (sgi_base + gicr::GICR_ICENABLER) as *mut u32;
+        icenabler.write_volatile(!hv_mask);
+
+        // Restore guest enables, force IRQ 26 set.
         let isenabler = (sgi_base + gicr::GICR_ISENABLER) as *mut u32;
-        isenabler.write_volatile(vgicr.isenabler);
+        isenabler.write_volatile(vgicr.isenabler | (1 << 26));
 
         for i in 0..8 {
             let reg = (sgi_base + gicr::GICR_IPRIORITYR + i * 4) as *mut u32;
             reg.write_volatile(vgicr.ipriorityr[i]);
         }
+        // Force IRQ 26 priority to 0xa0 after full restore.
+        let ipriorityr26 = (sgi_base + gicr::GICR_IPRIORITYR + 26) as *mut u8;
+        ipriorityr26.write_volatile(0xa0);
 
         // ICFGR0 (SGIs) is read-only, only write ICFGR1 (PPIs)
         let icfgr1 = (sgi_base + gicr::GICR_ICFGR + 4) as *mut u32;

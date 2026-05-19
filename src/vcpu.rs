@@ -318,37 +318,4 @@ pub fn drain_incoming_vcpus() {
     }
 }
 
-/// Drain this pCPU's pending_wake_ids queue.
-/// For each PendingWake: inject the IRQ into the VCpu's pending_virqs,
-/// remove from blocked list, and enqueue.
-/// Called by IPI_EVENT_RESCHED handler — always local, race-free.
-pub fn drain_pending_wake_ids() {
-    let cpu = this_cpu_data();
-    let wakes: Vec<crate::cpu_data::PendingWake> = {
-        let mut q = cpu.pending_wake_ids.lock();
-        q.drain(..).collect()
-    };
-    for wake in wakes {
-        if let Some(vcpu) = cpu.scheduler.find_blocked(wake.vcpu_id) {
-            // Common path: vCPU is still Blocked — inject IRQ and wake it.
-            vcpu.push_pending_irq(wake.irq_id, wake.is_hardware);
-            if vcpu.transition(VCpuState::Blocked, VCpuState::Ready).is_ok() {
-                cpu.scheduler.remove_blocked(wake.vcpu_id);
-                cpu.scheduler.enqueue(vcpu);
-            }
-        } else if let Some(vcpu) = cpu.scheduler.find_ready(wake.vcpu_id) {
-            // Race: vCPU was woken by check_blocked_timers between the cross-pCPU push
-            // and this IPI handler. Already in runqueue; push IRQ for next switch-in.
-            vcpu.push_pending_irq(wake.irq_id, wake.is_hardware);
-        } else if let Some(ref vcpu) = cpu.scheduler.current {
-            // Race: vCPU is already Running (switched in before IPI arrived).
-            // Push IRQ directly — vcpu_vmreturn will drain it on the next EL2 exit.
-            if vcpu.id == wake.vcpu_id {
-                vcpu.push_pending_irq(wake.irq_id, wake.is_hardware);
-            }
-            // If vcpu_id doesn't match current, the vCPU is Stopped or on another pCPU.
-            // Stopped: SGI to a stopped vCPU is discarded (correct).
-            // Another pCPU: shouldn't happen since drain_pending_wake_ids is local-only.
-        }
-    }
-}
+

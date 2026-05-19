@@ -27,15 +27,6 @@ use crate::ENTERED_CPUS;
 use core::fmt::Debug;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-/// A pending cross-pCPU SGI wake-up request.
-#[derive(Clone, Debug)]
-pub struct PendingWake {
-    pub vcpu_id: usize,
-    pub irq_id: usize,
-    /// true for physical SPI/PPI (GIC LR.HW=1), false for virtual-only (SGI, synthetic timer)
-    pub is_hardware: bool,
-}
-
 // global_asm!(include_str!("./arch/aarch64/page_table.S"),);
 
 #[repr(C)]
@@ -57,9 +48,6 @@ pub struct PerCpu {
     /// Incoming vCPU queue for PSCI CPU_ON cross-pCPU delivery.
     /// Sender pushes Arc<VCpu> then sends IPI_EVENT_INCOMING_VCPU.
     pub incoming_vcpus: Mutex<VecDeque<Arc<VCpu>>>,
-    /// Pending cross-pCPU SGI wake-up requests.
-    /// IPI_EVENT_RESCHED handler drains this: injects IRQ and enqueues target vCPU.
-    pub pending_wake_ids: Mutex<VecDeque<PendingWake>>,
     // percpu stack (implicit, from struct end to PER_CPU_SIZE boundary)
 }
 
@@ -88,7 +76,6 @@ impl PerCpu {
                 need_resched: AtomicBool::new(false),
                 current_vcpu: None,
                 incoming_vcpus: Mutex::new(VecDeque::new()),
-                pending_wake_ids: Mutex::new(VecDeque::new()),
             })
         };
         unsafe {

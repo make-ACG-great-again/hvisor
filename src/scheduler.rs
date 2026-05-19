@@ -113,6 +113,11 @@ impl PerCpuScheduler {
         }
     }
 
+    /// Iterate over VCpus in a specific priority run queue (for diagnostics).
+    pub fn run_queue_iter(&self, prio: usize) -> impl Iterator<Item = &Arc<VCpu>> {
+        self.run_queue[prio].iter()
+    }
+
     /// Check if the run queues are all empty (does NOT include blocked_vcpus).
     pub fn is_empty(&self) -> bool {
         self.run_queue.iter().all(|q| q.is_empty())
@@ -187,12 +192,11 @@ impl PerCpuScheduler {
 
             let blocked_at = entry.blocked_at_cnt;
             let one_tick   = crate::arch::timer::tick_period_cnt();
-            let timed_out  = current_cnt >= blocked_at.wrapping_add(one_tick);
-            // Absolute timeout: 10 ticks (100ms), matching the old version.
+            // Absolute timeout: 10 ticks (100ms) — last-resort wakeup in case IRQ was lost.
             let ten_ticks  = one_tick.wrapping_mul(10);
             let absolute_timeout = current_cnt >= blocked_at.wrapping_add(ten_ticks);
-            let no_timer_timeout = (timed_out && entry.vcpu.has_pending_irqs())
-                || absolute_timeout;
+            // Wake immediately if IRQ already pending, or fall back to absolute timeout.
+            let no_timer_timeout = entry.vcpu.has_pending_irqs() || absolute_timeout;
 
             if timer_expired {
                 let entry = self.blocked_vcpus.remove(i).unwrap();
@@ -285,6 +289,27 @@ impl PerCpuScheduler {
     /// Number of blocked VCpus.
     pub fn blocked_vcpu_count(&self) -> usize {
         self.blocked_vcpus.len()
+    }
+
+    /// Wake all blocked VCpus that have pending IRQs in their pending_virqs queue.
+    /// Called by IPI_EVENT_RESCHED handler after cross-pCPU push_pending_irq.
+    /// Returns the number of VCpus woken.
+    pub fn drain_pending_irq_wakeups(&mut self) -> usize {
+        let mut woken = 0;
+        let mut i = 0;
+        while i < self.blocked_vcpus.len() {
+            if self.blocked_vcpus[i].vcpu.has_pending_irqs() {
+                let entry = self.blocked_vcpus.remove(i).unwrap();
+                if entry.vcpu.transition(VCpuState::Blocked, VCpuState::Ready).is_ok() {
+                    self.enqueue(entry.vcpu);
+                    woken += 1;
+                }
+                // don't increment i — next element shifted into position i
+            } else {
+                i += 1;
+            }
+        }
+        woken
     }
 
     /// Return (cntv_cval, cntv_ctl, cntvoff, blocked_at) of the first blocked entry, for diagnostics.
@@ -408,10 +433,14 @@ pub fn vcpu_switch_in(vcpu: &VCpu, prev_zone_id: Option<usize>) {
 /// General registers are already in each vCPU's TrapFrame (saved by trap.S on entry).
 /// After schedule() returns, the caller calls `vmreturn(vcpu.arch.trapframe_ptr())`.
 #[cfg(target_arch = "aarch64")]
+pub static SCHEDULE_CALL_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 pub fn schedule() {
     use crate::cpu_data::this_cpu_data;
     use crate::vcpu::drain_incoming_vcpus;
     use core::sync::atomic::Ordering;
+
+    let sched_n = SCHEDULE_CALL_COUNTER.fetch_add(1, Ordering::Relaxed);
 
     // Drain incoming VCPUs (PSCI CPU_ON cross-pCPU delivery) before picking.
     drain_incoming_vcpus();
@@ -427,17 +456,26 @@ pub fn schedule() {
             crate::arch::timer::el2_timer_rearm();
             return;
         }
-        // Fast path missed — log why (trace only, warn was causing UART timing issues).
-        trace!("[SCH-SLOWPATH] pcpu={} vcpu={} state={:?} rq={} blocked={}",
-            cpu.id, current.id, current.state(),
-            cpu.scheduler.len(), cpu.scheduler.has_blocked_vcpus());
+        if sched_n % 10000 == 0 {
+            info!("[SCH] #{} slowpath vcpu={} state={:?} rq={} blocked={}",
+                sched_n, current.id, current.state(),
+                cpu.scheduler.len(), cpu.scheduler.has_blocked_vcpus());
+        }
     } else {
-        trace!("[SCH-SLOWPATH] pcpu={} no current vcpu rq={} blocked={}",
-            cpu.id, cpu.scheduler.len(), cpu.scheduler.has_blocked_vcpus());
+        if sched_n % 10000 == 0 {
+            info!("[SCH] #{} slowpath no-current rq={} blocked={}",
+                sched_n, cpu.scheduler.len(), cpu.scheduler.has_blocked_vcpus());
+        }
     }
 
     let prev_vcpu = cpu.scheduler.current.take();
     let prev_zone_id: Option<usize>;
+
+    // Clear TPIDR_EL2: from this point until vmreturn(), no guest is running in EL1.
+    // _el2h_irq_entry checks TPIDR_EL2 to decide whether to use the full vmexit path.
+    // SP is now the Rust call stack, not the TrapFrame, so the EL1-guest path must not fire.
+    #[cfg(target_arch = "aarch64")]
+    unsafe { core::arch::asm!("msr TPIDR_EL2, xzr", options(nostack, preserves_flags)) };
 
     // Save outgoing VCpu
     if let Some(ref prev) = prev_vcpu {
@@ -505,6 +543,14 @@ pub fn schedule() {
     loop {
         let next_vcpu = pick_next_or_idle(prev_zone_id);
 
+        if sched_n % 10000 == 0 {
+            let cpu = this_cpu_data();
+            info!("[SCH] #{} picked={:?} rq={} blocked={}",
+                sched_n,
+                next_vcpu.as_ref().map(|v| v.id),
+                cpu.scheduler.len(), cpu.scheduler.blocked_vcpu_count());
+        }
+
         if let Some(next_vcpu) = next_vcpu {
             let cpu = this_cpu_data();
             if next_vcpu.transition(VCpuState::Ready, VCpuState::Running).is_err() {
@@ -515,16 +561,33 @@ pub fn schedule() {
                 break;
             }
 
-            trace!("[SCH] pcpu={} switching to vcpu={}", cpu.id, next_vcpu.id);
+            {
+                use core::sync::atomic::{AtomicU64, Ordering};
+                static SWITCH_COUNT: AtomicU64 = AtomicU64::new(0);
+                let n = SWITCH_COUNT.fetch_add(1, Ordering::Relaxed);
+                if n % 10000 == 0 {
+                    info!("[SCH] switch #{} sched_n={} pcpu={} -> vcpu={}", n, sched_n, cpu.id, next_vcpu.id);
+                }
+            }
+
             cpu.scheduler.time_slice_remaining = DEFAULT_TIME_SLICE;
             cpu.scheduler.current = Some(next_vcpu.clone());
+            if sched_n % 10000 == 0 {
+                info!("[SCH] #{} sched_cur set -> vcpu={}", sched_n, next_vcpu.id);
+            }
 
             vcpu_switch_in(&next_vcpu, prev_zone_id);
+            if sched_n % 10000 == 0 {
+                info!("[SCH] #{} switch_in done vcpu={}", sched_n, next_vcpu.id);
+            }
 
             crate::arch::timer::el2_timer_rearm();
 
             // Update percpu current_vcpu
             cpu.current_vcpu = Some(next_vcpu);
+            if sched_n % 10000 == 0 {
+                info!("[SCH] #{} current_vcpu set, returning", sched_n);
+            }
             break;
         } else {
             break; // pick_next_or_idle returned None (went through idle) — exit loop.
@@ -542,8 +605,15 @@ fn pick_next_or_idle(prev_zone_id: Option<usize>) -> Option<Arc<VCpu>> {
         return Some(vcpu);
     }
 
-    warn!("[IDLE] pcpu={} entering el2_idle_loop rq={} blocked={}",
-        cpu.id, cpu.scheduler.len(), cpu.scheduler.blocked_vcpu_count());
+    {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static IDLE_ENTER: AtomicU64 = AtomicU64::new(0);
+        let n = IDLE_ENTER.fetch_add(1, Ordering::Relaxed);
+        if n % 10000 == 0 {
+            info!("[IDLE] pcpu={} entering el2_idle_loop #{} rq={} blocked={}",
+                cpu.id, n, cpu.scheduler.len(), cpu.scheduler.blocked_vcpu_count());
+        }
+    }
     el2_idle_loop()
 }
 
@@ -557,19 +627,26 @@ fn el2_idle_loop() -> Option<Arc<VCpu>> {
     use crate::cpu_data::this_cpu_data;
     use core::sync::atomic::Ordering;
 
+    // Clear TPIDR_EL2 so _el2h_irq_entry knows no guest is in EL1 right now.
+    // vmreturn() will set it again to the TrapFrame ptr before next eret to EL1.
+    unsafe { core::arch::asm!("msr TPIDR_EL2, xzr", options(nostack, preserves_flags)) };
+
     loop {
         let cpu = this_cpu_data();
-        match cpu.scheduler.earliest_blocked_timer_cntpct() {
-            Some(target) => {
-                crate::arch::timer::el2_timer_arm_at(target);
-            }
-            None => {
-                if cpu.scheduler.has_blocked_vcpus() {
-                    crate::arch::timer::el2_timer_rearm();
-                } else {
-                    crate::arch::timer::el2_timer_disable();
-                }
-            }
+        // Arm EL2 timer at the earlier of the earliest blocked vCPU's virtual timer
+        // expiry and one tick from now. The one-tick cap guarantees check_blocked_timers
+        // runs within 10ms, so absolute_timeout and has_pending_irqs() wakeups are
+        // never delayed longer than one tick regardless of guest timer deadlines.
+        if cpu.scheduler.has_blocked_vcpus() {
+            let one_tick_from_now = crate::arch::timer::current_cntpct()
+                .wrapping_add(crate::arch::timer::tick_period_cnt());
+            let target = match cpu.scheduler.earliest_blocked_timer_cntpct() {
+                Some(t) => t.min(one_tick_from_now),
+                None    => one_tick_from_now,
+            };
+            crate::arch::timer::el2_timer_arm_at(target);
+        } else {
+            crate::arch::timer::el2_timer_disable();
         }
 
         // Enable IRQs so physical interrupts are delivered via _el2_irq_handler.
@@ -581,20 +658,39 @@ fn el2_idle_loop() -> Option<Arc<VCpu>> {
         unsafe { core::arch::asm!("msr daifset, #0xf") };
 
         // Unconditionally drain incoming VCPUs after WFI.
-        // The SGI that woke us may not have been acknowledged via ICC_IAR1_EL1
-        // in _el2_irq_handler (spurious read at EL2), so incoming_vcpus may still
-        // have entries even though no check_events() drain ran.
         crate::vcpu::drain_incoming_vcpus();
+
+        // Explicitly check blocked vCPU timers — EL2 timer may have been armed
+        // at a blocked vCPU's far-future deadline, so sched_tick_handler may not
+        // have run yet. This ensures absolute_timeout and has_pending_irqs() wakeups
+        // fire promptly regardless of the EL2 timer target.
+        let cpu = this_cpu_data();
+        let current_cnt = crate::arch::timer::current_cntpct();
+        let woken = cpu.scheduler.check_blocked_timers(current_cnt);
+        if woken > 0 {
+            cpu.need_resched.store(true, Ordering::Release);
+        }
 
         let cpu = this_cpu_data();
         if let Some(vcpu) = cpu.scheduler.pick_next() {
+            trace!("[IDLE] pcpu={} woke up, picked vcpu={}", cpu.id, vcpu.id);
             return Some(vcpu);
         }
 
         if cpu.need_resched.load(Ordering::Acquire) {
             cpu.need_resched.store(false, Ordering::Release);
             if let Some(vcpu) = cpu.scheduler.pick_next() {
+                trace!("[IDLE] pcpu={} woke up (resched), picked vcpu={}", cpu.id, vcpu.id);
                 return Some(vcpu);
+            }
+        }
+        {
+            use core::sync::atomic::{AtomicU64, Ordering};
+            static IDLE_NOWAKE: AtomicU64 = AtomicU64::new(0);
+            let n = IDLE_NOWAKE.fetch_add(1, Ordering::Relaxed);
+            if n % 10000 == 0 {
+                info!("[IDLE] pcpu={} WFI wake but no vcpu #{}: rq={} blocked={}",
+                    cpu.id, n, cpu.scheduler.len(), cpu.scheduler.blocked_vcpu_count());
             }
         }
     }
