@@ -81,8 +81,7 @@ _hyp_trap_vector:
 	ventry	.
 
 	handle_vmexit EXIT_REASON_EL2_ABORT
-	.align	7				// EL2h IRQ — lightweight path, NOT handle_vmexit
-	b	_el2_irq_handler
+	ventry	_el2_irq_handler	// EL2h IRQ: lightweight handler (EL2 code only)
 	ventry	.
 	ventry	.
 
@@ -97,12 +96,8 @@ _hyp_trap_vector:
 	ventry	.
 
 // ============================================================
-// EL2h IRQ lightweight handler
-//
-// Called when an IRQ fires while the CPU executes at EL2
-// (idle loop, schedule(), etc.). Saves caller-saved registers,
-// calls el2_irq_handler() (GIC processing), then eret back.
-// Does NOT go through arch_handle_exit or vmreturn.
+// EL2h IRQ handler — only reached when IRQ interrupts EL2 code.
+// EL1 IRQs are routed via handle_vmexit EXIT_REASON_EL1_IRQ above.
 // ============================================================
 .global _el2_irq_handler
 _el2_irq_handler:
@@ -119,7 +114,7 @@ _el2_irq_handler:
 	stp	x18, x29, [sp, #0x90]
 	str	x30, [sp, #-8]!
 
-	bl	{1}			// el2_irq_handler()
+	bl	{1}			// el2_irq_handler() — handles GIC, no return value
 
 	ldr	x30, [sp], #8
 	ldp	x0,  x1,  [sp, #0x00]
@@ -133,5 +128,4 @@ _el2_irq_handler:
 	ldp	x16, x17, [sp, #0x80]
 	ldp	x18, x29, [sp, #0x90]
 	add	sp, sp, #0xa0
-
 	eret
