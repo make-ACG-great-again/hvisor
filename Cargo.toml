@@ -53,6 +53,7 @@ iommu = [] # supported by: aarch64, riscv64
 pci = [] # supported by: aarch64, riscv64,loongarch64
 share_s2pt = ["iommu"]
 print_timestamp = [] # print timestamp when logging
+vcpu_debug_trace = [] # enable high-frequency vCPU/GIC/IRQ debug counters and logs (off by default)
 
 ############# IOMMU ##############
 riscv_iommu = ["iommu"]

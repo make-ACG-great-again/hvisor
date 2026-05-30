@@ -215,12 +215,30 @@ fn vgicr_shadow_access(mmio: &mut MMIOAccess, vcpu_id: usize, reg: usize) {
             }
         }
         r if r == GICR_SGI_BASE + GICR_ISENABLER => {
-            if mmio.is_write { vgicr.isenabler |= mmio.value as u32; }
-            else { mmio.value = vgicr.isenabler as usize; }
+            if mmio.is_write {
+                // Mask hypervisor-owned PPIs/SGIs out of guest writes; we
+                // manage their enable state ourselves and the shadow must
+                // always reflect that they are enabled (so restore_vgicr
+                // re-asserts them after a vCPU switch-in).
+                let hv_mask: u32 = (1u32 << 26) | (1u32 << MAINTENACE_INTERRUPT) | (1u32 << SGI_IPI_ID);
+                vgicr.isenabler |= (mmio.value as u32) & !hv_mask;
+                vgicr.isenabler |= hv_mask; // keep hv bits set in shadow
+            } else {
+                mmio.value = vgicr.isenabler as usize;
+            }
         }
         r if r == GICR_SGI_BASE + GICR_ICENABLER => {
-            if mmio.is_write { vgicr.isenabler &= !(mmio.value as u32); }
-            else { mmio.value = vgicr.isenabler as usize; }
+            if mmio.is_write {
+                // Drop hv bits from the clear-mask so guest cannot disable
+                // hypervisor-owned PPIs/SGIs in the shadow. Hardware-side
+                // filtering is done by the caller before mmio_perform_access.
+                let hv_mask: u32 = (1u32 << 26) | (1u32 << MAINTENACE_INTERRUPT) | (1u32 << SGI_IPI_ID);
+                let clear = (mmio.value as u32) & !hv_mask;
+                vgicr.isenabler &= !clear;
+                vgicr.isenabler |= hv_mask; // keep hv bits set in shadow
+            } else {
+                mmio.value = vgicr.isenabler as usize;
+            }
         }
         r if r == GICR_SGI_BASE + GICR_ISPENDR => {
             if mmio.is_write { vgicr.ispendr |= mmio.value as u32; }

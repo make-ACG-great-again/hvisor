@@ -22,7 +22,6 @@ pub mod vgic;
 
 use core::arch::asm;
 use core::ptr::write_volatile;
-use core::sync::atomic::AtomicU64;
 
 use alloc::vec::Vec;
 use gicr::init_lpi_prop;
@@ -87,25 +86,32 @@ fn gicv3_clear_pending_irqs() {
     }
 }
 
-static TIMER_INTERRUPT_COUNTER: AtomicU64 = AtomicU64::new(0);
-// how often to print timer interrupt counter
-const TIMER_INTERRUPT_PRINT_INTERVAL: u64 = 50;
 
 pub fn gicv3_handle_irq_el1() {
-    use core::sync::atomic::{AtomicU64, Ordering};
-    static GIC_ENTRY_COUNT: AtomicU64 = AtomicU64::new(0);
-    let gic_n = GIC_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed);
-    if gic_n % 10000 == 0 {
-        info!("[GIC-EL1] enter #{}", gic_n);
-    }
+    #[cfg(feature = "vcpu_debug_trace")]
+    let gic_n = {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static GIC_ENTRY_COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = GIC_ENTRY_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n % 10000 == 0 {
+            info!("[GIC-EL1] enter #{}", n);
+        }
+        n
+    };
+    #[cfg(feature = "vcpu_debug_trace")]
     let mut irq26_count = 0u32;
+    #[cfg(feature = "vcpu_debug_trace")]
     let mut irq27_count = 0u32;
+    #[cfg(feature = "vcpu_debug_trace")]
     let mut other_count = 0u32;
+    #[cfg(feature = "vcpu_debug_trace")]
     let mut loop_iter = 0u32;
-    static LOOP_LOG: AtomicU64 = AtomicU64::new(0);
     while let Some(irq_id) = pending_irq() {
-        loop_iter += 1;
+        #[cfg(feature = "vcpu_debug_trace")]
         {
+            use core::sync::atomic::{AtomicU64, Ordering};
+            static LOOP_LOG: AtomicU64 = AtomicU64::new(0);
+            loop_iter += 1;
             let n = LOOP_LOG.fetch_add(1, Ordering::Relaxed);
             if n % 5000 == 0 {
                 info!("[GIC-LOOP] #{} gic_n={} iter={} irq={}", n, gic_n, loop_iter, irq_id);
@@ -114,11 +120,13 @@ pub fn gicv3_handle_irq_el1() {
         if irq_id < 8 {
             trace!("sgi get {}, try to handle...", irq_id);
             deactivate_irq(irq_id);
-            let mut ipi_handled = false;
             if irq_id == SGI_IPI_ID as _ {
-                ipi_handled = check_events();
-            }
-            if !ipi_handled {
+                // Hypervisor-private IPI SGI. Always consume here; never
+                // inject into guest, even when the software event queue is
+                // empty (race between two senders may leave A's SGI arriving
+                // with no event left to pop).
+                check_events();
+            } else {
                 trace!("sgi get {}, inject", irq_id);
                 schedule_inject_irq(irq_id, false);
             }
@@ -129,41 +137,52 @@ pub fn gicv3_handle_irq_el1() {
             if irq_id == 26 {
                 // EL2 physical timer (CNTHP) — scheduling tick, private to hypervisor.
                 // Must NOT be injected into the guest.
-                irq26_count += 1;
+                #[cfg(feature = "vcpu_debug_trace")]
+                {
+                    irq26_count += 1;
+                }
                 #[cfg(target_arch = "aarch64")]
                 {
-                    use core::sync::atomic::{AtomicU64, Ordering};
-                    static TICK_CALL: AtomicU64 = AtomicU64::new(0);
-                    let t = TICK_CALL.fetch_add(1, Ordering::Relaxed);
-                    if t % 10000 == 0 { info!("[TICK-CALL] before #{}", t); }
+                    #[cfg(feature = "vcpu_debug_trace")]
+                    {
+                        use core::sync::atomic::{AtomicU64, Ordering};
+                        static TICK_CALL: AtomicU64 = AtomicU64::new(0);
+                        let t = TICK_CALL.fetch_add(1, Ordering::Relaxed);
+                        if t % 10000 == 0 { info!("[TICK-CALL] before #{}", t); }
+                        crate::arch::timer::sched_tick_handler();
+                        if t % 10000 == 0 { info!("[TICK-CALL] after #{}", t); }
+                    }
+                    #[cfg(not(feature = "vcpu_debug_trace"))]
                     crate::arch::timer::sched_tick_handler();
-                    if t % 10000 == 0 { info!("[TICK-CALL] after #{}", t); }
                 }
                 deactivate_irq(irq_id);
                 continue;
             } else if irq_id == 27 {
-                irq27_count += 1;
-                // virtual timer interrupt
-                TIMER_INTERRUPT_COUNTER.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
-                if TIMER_INTERRUPT_COUNTER.load(core::sync::atomic::Ordering::SeqCst)
-                    % TIMER_INTERRUPT_PRINT_INTERVAL
-                    == 0
+                #[cfg(feature = "vcpu_debug_trace")]
                 {
-                    trace!(
-                        "Virtual timer interrupt, counter = {}",
-                        TIMER_INTERRUPT_COUNTER.load(core::sync::atomic::Ordering::SeqCst)
-                    );
+                    irq27_count += 1;
                 }
+                // virtual timer interrupt — fall through to the common
+                // SPI/PPI inject path below (schedule_inject_irq + EOIR/DIR).
             } else if irq_id == 25 {
-                other_count += 1;
+                #[cfg(feature = "vcpu_debug_trace")]
+                {
+                    other_count += 1;
+                }
                 // maintenace interrupt
                 handle_maintenace_interrupt();
             } else if irq_id > 31 {
-                other_count += 1;
+                #[cfg(feature = "vcpu_debug_trace")]
+                {
+                    other_count += 1;
+                }
                 //inject phy irq
                 trace!("*** get spi_irq id = {}", irq_id);
             } else {
-                other_count += 1;
+                #[cfg(feature = "vcpu_debug_trace")]
+                {
+                    other_count += 1;
+                }
                 warn!("not konw irq id = {}", irq_id);
             }
             let lr_written = if irq_id != 25 {
@@ -185,14 +204,16 @@ pub fn gicv3_handle_irq_el1() {
             }
         }
     }
-    // Log IRQ counts if anything unusual (irq26 > 1, or total > 3).
-    let total = irq26_count + irq27_count + other_count;
-    if gic_n % 10000 == 0 || loop_iter > 5 {
-        info!("[GIC-EL1] exit #{} iters={} irq26={} irq27={} other={}", gic_n, loop_iter, irq26_count, irq27_count, other_count);
-    }
-    if irq26_count > 1 || total > 3 {
-        warn!("[IRQ-STAT] #{} irq26={} irq27={} other={} total={}",
-            gic_n, irq26_count, irq27_count, other_count, total);
+    #[cfg(feature = "vcpu_debug_trace")]
+    {
+        let total = irq26_count + irq27_count + other_count;
+        if gic_n % 10000 == 0 || loop_iter > 5 {
+            info!("[GIC-EL1] exit #{} iters={} irq26={} irq27={} other={}", gic_n, loop_iter, irq26_count, irq27_count, other_count);
+        }
+        if irq26_count > 1 || total > 3 {
+            warn!("[IRQ-STAT] #{} irq26={} irq27={} other={} total={}",
+                gic_n, irq26_count, irq27_count, other_count, total);
+        }
     }
 }
 

@@ -91,83 +91,113 @@ pub fn clear_events(cpu: usize) {
 
 pub fn check_events() -> bool {
     let cpu_data = this_cpu_data();
-    let event = fetch_event(cpu_data.id);
-    match event {
-        Some(IPI_EVENT_WAKEUP) => {
-            cpu_data.arch_cpu.run();
-            false
-        }
-        Some(IPI_EVENT_SHUTDOWN) => {
-            cpu_data.arch_cpu.idle();
-            false
-        }
-        Some(IPI_EVENT_VIRTIO_INJECT_IRQ) => {
-            handle_virtio_irq();
-            true
-        }
-        Some(IPI_EVENT_WAKEUP_VIRTIO_DEVICE) => {
-            inject_irq(IRQ_WAKEUP_VIRTIO_DEVICE, false);
-            true
-        }
-        Some(IPI_EVENT_ZONE_SHUTDOWN) => {
-            // Zone is being destroyed. Clear all vCPUs from this pCPU's scheduler
-            // (safe here — we are in EL2, guest is not running).
-            // idle() sets power_on=false and re-enters the scheduler loop.
-            info!("[SHUTDOWN] pcpu{} received IPI_EVENT_ZONE_SHUTDOWN, calling clear_all+idle", cpu_data.id);
-            cpu_data.scheduler.clear_all();
-            cpu_data.current_vcpu = None;
-            cpu_data.arch_cpu.idle();
-        }
-        Some(IPI_EVENT_RESCHED) => {
-            // Wake any locally-blocked vCPUs that now have pending IRQs.
-            // Senders push IRQ directly into pending_virqs (Mutex-safe cross-pCPU),
-            // then send this IPI so we can do the scheduler-local transition+enqueue.
-            let woken = cpu_data.scheduler.drain_pending_irq_wakeups();
-            #[cfg(target_arch = "aarch64")]
-            {
-                if woken > 0 {
-                    cpu_data.need_resched.store(true, core::sync::atomic::Ordering::Release);
+    let mut handled = false;
+    let mut drained: u32 = 0;
+    loop {
+        let event = fetch_event(cpu_data.id);
+        match event {
+            None => break,
+            Some(IPI_EVENT_WAKEUP) => {
+                cpu_data.arch_cpu.run();
+            }
+            Some(IPI_EVENT_SHUTDOWN) => {
+                cpu_data.arch_cpu.idle();
+            }
+            Some(IPI_EVENT_VIRTIO_INJECT_IRQ) => {
+                handle_virtio_irq();
+                handled = true;
+            }
+            Some(IPI_EVENT_WAKEUP_VIRTIO_DEVICE) => {
+                #[cfg(all(feature = "gicv3", target_arch = "aarch64"))]
+                crate::device::irqchip::gicv3::schedule_inject_irq(
+                    IRQ_WAKEUP_VIRTIO_DEVICE,
+                    false,
+                );
+                #[cfg(not(all(feature = "gicv3", target_arch = "aarch64")))]
+                inject_irq(IRQ_WAKEUP_VIRTIO_DEVICE, false);
+                handled = true;
+            }
+            Some(IPI_EVENT_ZONE_SHUTDOWN) => {
+                // Zone is being destroyed. Clear all vCPUs from this pCPU's scheduler
+                // (safe here — we are in EL2, guest is not running).
+                // Also wipe physical timer state so a stale CNTV/CNTP comparator
+                // does not keep asserting IRQ 26/27 to a pCPU that has no
+                // current_vcpu (would otherwise produce an IRQ storm).
+                info!("[SHUTDOWN] pcpu{} received IPI_EVENT_ZONE_SHUTDOWN, calling clear_all+idle", cpu_data.id);
+                cpu_data.scheduler.clear_all();
+                cpu_data.current_vcpu = None;
+                #[cfg(target_arch = "aarch64")]
+                {
+                    use crate::arch::sysreg::write_sysreg;
+                    write_sysreg!(CNTV_CTL_EL0, 0u64);
+                    write_sysreg!(CNTV_CVAL_EL0, 0u64);
+                    write_sysreg!(CNTVOFF_EL2, 0u64);
+                    write_sysreg!(CNTP_CTL_EL0, 0u64);
+                    write_sysreg!(CNTP_CVAL_EL0, 0u64);
                 }
+                cpu_data.arch_cpu.idle();
             }
-            true
-        }
-        Some(IPI_EVENT_INCOMING_VCPU) => {
-            crate::vcpu::drain_incoming_vcpus();
-            #[cfg(target_arch = "aarch64")]
-            {
-                cpu_data.need_resched.store(true, core::sync::atomic::Ordering::Release);
+            Some(IPI_EVENT_RESCHED) => {
+                // Wake any locally-blocked vCPUs that now have pending IRQs.
+                let woken = cpu_data.scheduler.drain_pending_irq_wakeups();
+                if woken > 0 {
+                    cpu_data
+                        .need_resched
+                        .store(true, core::sync::atomic::Ordering::Release);
+                }
+                handled = true;
             }
-            true
+            Some(IPI_EVENT_INCOMING_VCPU) => {
+                crate::vcpu::drain_incoming_vcpus();
+                cpu_data
+                    .need_resched
+                    .store(true, core::sync::atomic::Ordering::Release);
+                handled = true;
+            }
+            Some(ev @ IPI_EVENT_CLEAR_INJECT_IRQ)
+            | Some(ev @ IPI_EVENT_UPDATE_HART_LINE)
+            | Some(ev @ IPI_EVENT_SEND_IPI) => {
+                arch_check_events(Some(ev));
+                handled = true;
+            }
+            Some(_) => {
+                // Unknown event id — drop it silently to avoid stalling the queue.
+            }
         }
-        Some(IPI_EVENT_CLEAR_INJECT_IRQ)
-        | Some(IPI_EVENT_UPDATE_HART_LINE)
-        | Some(IPI_EVENT_SEND_IPI) => {
-            arch_check_events(event);
-            true
-        }
-        // #[cfg(target_arch = "loongarch64")]
-        // Some(IPI_EVENT_CLEAR_INJECT_IRQ) => {
-        //     use crate::device::irqchip;
-        //     irqchip::ls7a2000::clear_hwi_injected_irq();
-        //     true
-        // }
-        // #[cfg(all(target_arch = "riscv64", feature = "plic"))]
-        // Some(IPI_EVENT_UPDATE_HART_LINE) => {
-        //     use crate::device::irqchip;
-        //     info!("cpu {} update hart line", cpu_data.id);
-        //     irqchip::plic::update_hart_line();
-        //     true
-        // }
-        // #[cfg(target_arch = "riscv64")]
-        // Some(IPI_EVENT_SEND_IPI) => {
-        //     // This event is different from events above, it is used to inject software interrupt.
-        //     // While events above will inject external interrupt.
-        //     use crate::arch::ipi::arch_ipi_handler;
-        //     arch_ipi_handler();
-        //     true
-        // }
-        _ => false,
+        drained = drained.saturating_add(1);
     }
+    // [EVT-BURST] rate-limited trace: emit on new max-per-pCPU and every Nth burst.
+    #[cfg(feature = "vcpu_debug_trace")]
+    if drained > 1 {
+        use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+        const MAX_PCPUS: usize = MAX_CPU_NUM;
+        static MAX_BURST: [AtomicU32; MAX_PCPUS] = {
+            const Z: AtomicU32 = AtomicU32::new(0);
+            [Z; MAX_PCPUS]
+        };
+        static BURST_COUNT: [AtomicU64; MAX_PCPUS] = {
+            const Z: AtomicU64 = AtomicU64::new(0);
+            [Z; MAX_PCPUS]
+        };
+        let id = cpu_data.id.min(MAX_PCPUS - 1);
+        let cur_max = MAX_BURST[id].load(Ordering::Relaxed);
+        let new_max = drained > cur_max;
+        if new_max {
+            MAX_BURST[id].store(drained, Ordering::Relaxed);
+        }
+        let n = BURST_COUNT[id].fetch_add(1, Ordering::Relaxed) + 1;
+        if new_max || n % 4096 == 0 {
+            trace!(
+                "[EVT-BURST] pcpu={} drained={} max={} total_bursts={}",
+                cpu_data.id,
+                drained,
+                MAX_BURST[id].load(Ordering::Relaxed),
+                n
+            );
+        }
+    }
+    let _ = drained;
+    handled
 }
 
 pub fn send_event(cpu_id: usize, ipi_int_id: usize, event_id: usize) {

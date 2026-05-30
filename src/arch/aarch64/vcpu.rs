@@ -575,9 +575,12 @@ pub fn restore_vgicr(vcpu: &crate::vcpu::VCpu) {
         let icenabler = (sgi_base + gicr::GICR_ICENABLER) as *mut u32;
         icenabler.write_volatile(!hv_mask);
 
-        // Restore guest enables, force IRQ 26 set.
+        // Restore guest enables, force every hv-owned bit set so 25/7/26 are
+        // always re-asserted on vCPU switch-in even if the shadow somehow
+        // dropped them (defence in depth — vgicr_shadow_access already keeps
+        // them set, but restore is the last line of defence).
         let isenabler = (sgi_base + gicr::GICR_ISENABLER) as *mut u32;
-        isenabler.write_volatile(vgicr.isenabler | (1 << 26));
+        isenabler.write_volatile(vgicr.isenabler | hv_mask);
 
         for i in 0..8 {
             let reg = (sgi_base + gicr::GICR_IPRIORITYR + i * 4) as *mut u32;

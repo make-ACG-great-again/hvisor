@@ -256,7 +256,13 @@ impl<'a> HyperCall<'a> {
         // Extract cpu_set under read lock only — do NOT hold write lock across IPI/wait.
         // If we held the write lock here, target pCPUs running zone1 guest code could
         // trap into EL2 (e.g. WFI, SPI) and try to acquire zone.read(), deadlocking.
-        let cpu_set: alloc::vec::Vec<usize> = zone.read().cpu_set().iter().collect();
+        // Also collect vcpu_ids here for reclamation at the end of shutdown.
+        let (cpu_set, vcpu_ids) = {
+            let zone_r = zone.read();
+            let cpu_set: alloc::vec::Vec<usize> = zone_r.cpu_set().iter().collect();
+            let vcpu_ids: alloc::vec::Vec<usize> = zone_r.vcpus().keys().cloned().collect();
+            (cpu_set, vcpu_ids)
+        };
 
         cpu_set.iter().for_each(|&cpu_id| {
             {
@@ -322,6 +328,16 @@ impl<'a> HyperCall<'a> {
         drop(pci_list);
 
         remove_zone(zone_id as _);
+
+        // Reclaim VCpu IDs back into the global pool so the next zone start
+        // does not allocate ever-increasing ids. Done after remove_zone (and
+        // after all Arc<VCpu> are dropped via vcpus_mut().clear() above) so
+        // there is no risk of an old VCpu reference resurrecting an id while
+        // it is sitting in the free pool.
+        for id in vcpu_ids {
+            crate::vcpu::reclaim_vcpu_id(id);
+        }
+
         info!("zone {} has been shutdown", zone_id);
         HyperCallResult::Ok(0)
     }

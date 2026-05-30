@@ -45,7 +45,9 @@ global_asm!(
 /// Processes the interrupt via GIC and returns — trap.S then eret back to EL2 code.
 /// Must NOT call vmreturn or schedule.
 #[no_mangle]
+#[cfg(feature = "vcpu_debug_trace")]
 pub static EL2_IRQ_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "vcpu_debug_trace")]
 pub static EL1_IRQ_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Called from _el2_irq_handler in trap.S (EL2 WFI / EL2 context only).
@@ -55,17 +57,20 @@ pub static EL1_IRQ_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::
 /// as EXIT_REASON_EL1_IRQ, so schedule() runs there in the normal vmexit path.
 #[no_mangle]
 extern "C" fn el2_irq_handler() {
-    use core::sync::atomic::Ordering;
-    let n = EL2_IRQ_COUNTER.fetch_add(1, Ordering::Relaxed);
-    if n % 10000 == 0 {
-        use crate::arch::sysreg::read_sysreg;
-        let elr = read_sysreg!(ELR_EL2);
-        let spsr = read_sysreg!(SPSR_EL2);
-        let sp: u64;
-        unsafe { core::arch::asm!("mov {}, sp", out(reg) sp, options(nostack, preserves_flags)) };
-        let cur = crate::cpu_data::this_cpu_data().scheduler.current.as_ref().map(|v| v.id);
-        let sched_calls = crate::scheduler::SCHEDULE_CALL_COUNTER.load(Ordering::Relaxed);
-        info!("[EL2-IRQ] #{} elr={:#x} spsr={:#x} sp={:#x} sched_cur={:?} sched_calls={}", n, elr, spsr, sp, cur, sched_calls);
+    #[cfg(feature = "vcpu_debug_trace")]
+    {
+        use core::sync::atomic::Ordering;
+        let n = EL2_IRQ_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if n % 10000 == 0 {
+            use crate::arch::sysreg::read_sysreg;
+            let elr = read_sysreg!(ELR_EL2);
+            let spsr = read_sysreg!(SPSR_EL2);
+            let sp: u64;
+            unsafe { core::arch::asm!("mov {}, sp", out(reg) sp, options(nostack, preserves_flags)) };
+            let cur = crate::cpu_data::this_cpu_data().scheduler.current.as_ref().map(|v| v.id);
+            let sched_calls = crate::scheduler::SCHEDULE_CALL_COUNTER.load(Ordering::Relaxed);
+            info!("[EL2-IRQ] #{} elr={:#x} spsr={:#x} sp={:#x} sched_cur={:?} sched_calls={}", n, elr, spsr, sp, cur, sched_calls);
+        }
     }
     crate::device::irqchip::gic_handle_irq();
 }
@@ -152,11 +157,14 @@ pub fn arch_handle_exit(regs: &mut TrapFrame, exit_reason: u64) -> ! {
         ExceptionType::EXIT_REASON_EL1_IRQ | ExceptionType::EXIT_REASON_EL1_AARCH32_IRQ => {
             irqchip_handle_irq1();
             {
-                use core::sync::atomic::{AtomicU64, Ordering};
-                static AHE_GIC_RET: AtomicU64 = AtomicU64::new(0);
-                let n = AHE_GIC_RET.fetch_add(1, Ordering::Relaxed);
-                if n % 10000 == 0 {
-                    info!("[AHE-GIC-RET] #{} gic returned ok", n);
+                #[cfg(feature = "vcpu_debug_trace")]
+                {
+                    use core::sync::atomic::{AtomicU64, Ordering};
+                    static AHE_GIC_RET: AtomicU64 = AtomicU64::new(0);
+                    let n = AHE_GIC_RET.fetch_add(1, Ordering::Relaxed);
+                    if n % 10000 == 0 {
+                        info!("[AHE-GIC-RET] #{} gic returned ok", n);
+                    }
                 }
             }
         }
@@ -179,6 +187,7 @@ pub fn arch_handle_exit(regs: &mut TrapFrame, exit_reason: u64) -> ! {
     }
 
     let cpu = this_cpu_data();
+    #[cfg(feature = "vcpu_debug_trace")]
     {
         use core::sync::atomic::{AtomicU64, Ordering};
         static AHE_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -213,24 +222,31 @@ pub fn arch_handle_exit(regs: &mut TrapFrame, exit_reason: u64) -> ! {
 ///
 /// If current_vcpu is None (e.g. after IPI_EVENT_ZONE_SHUTDOWN cleared it),
 /// re-enter the scheduler (el2_idle_loop) instead.
+#[cfg(feature = "vcpu_debug_trace")]
 pub static VMRETURN_CALL_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn vcpu_vmreturn() -> ! {
     use crate::arch::sysreg::{read_sysreg, write_sysreg};
-    use core::sync::atomic::Ordering;
-    static VVR_ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-    let vvr_n = VVR_ENTRY.fetch_add(1, Ordering::Relaxed);
-    if vvr_n % 10000 == 0 {
-        info!("[VVR] #{} entered vcpu_vmreturn sched_calls={}", vvr_n,
-            crate::scheduler::SCHEDULE_CALL_COUNTER.load(Ordering::Relaxed));
+    #[cfg(feature = "vcpu_debug_trace")]
+    {
+        use core::sync::atomic::Ordering;
+        static VVR_ENTRY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let vvr_n = VVR_ENTRY.fetch_add(1, Ordering::Relaxed);
+        if vvr_n % 10000 == 0 {
+            info!("[VVR] #{} entered vcpu_vmreturn sched_calls={}", vvr_n,
+                crate::scheduler::SCHEDULE_CALL_COUNTER.load(Ordering::Relaxed));
+        }
     }
     loop {
-        let loop_n = VMRETURN_CALL_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if loop_n % 10000 == 0 {
-            let cpu = this_cpu_data();
-            info!("[VVR-LOOP] #{} current_vcpu={:?} sched_calls={}", loop_n,
-                cpu.current_vcpu.as_ref().map(|v| v.id),
-                crate::scheduler::SCHEDULE_CALL_COUNTER.load(Ordering::Relaxed));
+        #[cfg(feature = "vcpu_debug_trace")]
+        {
+            let loop_n = VMRETURN_CALL_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if loop_n % 10000 == 0 {
+                let cpu = this_cpu_data();
+                info!("[VVR-LOOP] #{} current_vcpu={:?} sched_calls={}", loop_n,
+                    cpu.current_vcpu.as_ref().map(|v| v.id),
+                    crate::scheduler::SCHEDULE_CALL_COUNTER.load(core::sync::atomic::Ordering::Relaxed));
+            }
         }
         if let Some(ref vcpu) = this_cpu_data().current_vcpu {
             // Compute once: will physical IRQ 27 arrive naturally (HW=1)?
@@ -268,6 +284,7 @@ fn vcpu_vmreturn() -> ! {
             }
 
             let trapframe_ptr = vcpu.arch.trapframe_ptr();
+            #[cfg(feature = "vcpu_debug_trace")]
             {
                 use core::sync::atomic::{AtomicU64, Ordering};
                 static VMRET_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -287,6 +304,7 @@ fn vcpu_vmreturn() -> ! {
         } else {
             // No current vCPU — re-enter scheduler (el2_idle_loop).
             // This happens after IPI_EVENT_ZONE_SHUTDOWN clears current_vcpu.
+            #[cfg(feature = "vcpu_debug_trace")]
             warn!("[VVR-ELSE] current_vcpu=None, calling schedule() sched_calls={}",
                 crate::scheduler::SCHEDULE_CALL_COUNTER.load(core::sync::atomic::Ordering::Relaxed));
             crate::scheduler::schedule();
@@ -296,10 +314,13 @@ fn vcpu_vmreturn() -> ! {
 }
 
 fn irqchip_handle_irq1() {
-    use core::sync::atomic::Ordering;
-    let n = EL1_IRQ_COUNTER.fetch_add(1, Ordering::Relaxed);
-    if n % 10000 == 0 && n > 0 {
-        trace!("[EL1-IRQ] irqchip_handle_irq1 called {} times (EL1 exit)", n);
+    #[cfg(feature = "vcpu_debug_trace")]
+    {
+        use core::sync::atomic::Ordering;
+        let n = EL1_IRQ_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if n % 10000 == 0 && n > 0 {
+            trace!("[EL1-IRQ] irqchip_handle_irq1 called {} times (EL1 exit)", n);
+        }
     }
     gic_handle_irq();
 }
@@ -433,6 +454,7 @@ fn handle_wfi_trap(regs: &mut TrapFrame) {
     let vcpu_id = vcpu.id;
     let pcpu_id = cpu.id;
 
+    #[cfg(feature = "vcpu_debug_trace")]
     {
         use core::sync::atomic::{AtomicU64, Ordering};
         static WFI_COUNT: AtomicU64 = AtomicU64::new(0);

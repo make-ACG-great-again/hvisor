@@ -15,7 +15,7 @@
 //
 use crate::{
     arch::{mm::new_s2_memory_set, sysreg::write_sysreg},
-    consts::{MAX_CPU_NUM, PAGE_SIZE},
+    consts::{MAX_CPU_NUM, PAGE_SIZE, PER_CPU_ARRAY_PTR, PER_CPU_SIZE},
     cpu_data::this_cpu_data,
     memory::{
         addr::PHYS_VIRT_OFFSET, mm::PARKING_MEMORY_SET, GuestPhysAddr, HostPhysAddr, MemFlags,
@@ -212,10 +212,25 @@ impl ArchCpu {
             let _lock = cpu_data.ctrl_lock.lock();
             self.power_on = false;
         }
-        // Re-enter the scheduler loop so this pCPU can be reused by a future zone_start.
-        info!("cpu {} idle, re-entering scheduler loop", self.cpuid);
-        loop {
-            crate::scheduler::schedule();
+        // Re-enter the scheduler loop on the per-pCPU boot stack so we are
+        // not running on the freed Box<VCpuStack> of a vCPU that just got
+        // dropped (use-after-free → cross-zone heap corruption on restart).
+        // The per-pCPU region at PER_CPU_ARRAY_PTR + (cpuid+1)*PER_CPU_SIZE
+        // lives for the full hypervisor lifetime.
+        info!(
+            "cpu {} idle, re-entering scheduler loop on percpu boot stack",
+            self.cpuid
+        );
+        let new_sp = percpu_boot_stack_top(self.cpuid);
+        unsafe {
+            core::arch::asm!(
+                "mov sp, {sp}",
+                "bl {idle_main}",
+                "b .",
+                sp = in(reg) new_sp,
+                idle_main = sym idle_main,
+                options(noreturn),
+            );
         }
     }
 
@@ -285,4 +300,29 @@ pub fn get_target_cpu(_irq: usize, zone_id: usize) -> usize {
         .cpu_set()
         .first_cpu()
         .unwrap()
+}
+
+/// Top of the per-pCPU region for `cpuid` — used as a safe SP for the idle
+/// scheduler loop after the previous vCPU stack was freed.
+fn percpu_boot_stack_top(cpuid: usize) -> usize {
+    let base = PER_CPU_ARRAY_PTR as usize;
+    base + (cpuid + 1) * PER_CPU_SIZE
+}
+
+/// Tail-called from `ArchCpu::idle()` after switching SP to the per-pCPU boot
+/// stack. Drives the scheduler loop and returns to guest via `vmreturn` once a
+/// runnable vCPU is picked.
+#[no_mangle]
+extern "C" fn idle_main() -> ! {
+    use crate::scheduler::schedule;
+    loop {
+        schedule();
+        let trapframe_ptr = this_cpu_data()
+            .current_vcpu
+            .as_ref()
+            .expect("idle_main: schedule() returned with no current_vcpu")
+            .arch
+            .trapframe_ptr();
+        unsafe { vmreturn(trapframe_ptr) }
+    }
 }

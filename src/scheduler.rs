@@ -432,7 +432,7 @@ pub fn vcpu_switch_in(vcpu: &VCpu, prev_zone_id: Option<usize>) {
 /// Called when `need_resched` is true or from IPI handlers.
 /// General registers are already in each vCPU's TrapFrame (saved by trap.S on entry).
 /// After schedule() returns, the caller calls `vmreturn(vcpu.arch.trapframe_ptr())`.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "vcpu_debug_trace"))]
 pub static SCHEDULE_CALL_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 pub fn schedule() {
@@ -440,6 +440,7 @@ pub fn schedule() {
     use crate::vcpu::drain_incoming_vcpus;
     use core::sync::atomic::Ordering;
 
+    #[cfg(feature = "vcpu_debug_trace")]
     let sched_n = SCHEDULE_CALL_COUNTER.fetch_add(1, Ordering::Relaxed);
 
     // Drain incoming VCPUs (PSCI CPU_ON cross-pCPU delivery) before picking.
@@ -456,12 +457,14 @@ pub fn schedule() {
             crate::arch::timer::el2_timer_rearm();
             return;
         }
+        #[cfg(feature = "vcpu_debug_trace")]
         if sched_n % 10000 == 0 {
             info!("[SCH] #{} slowpath vcpu={} state={:?} rq={} blocked={}",
                 sched_n, current.id, current.state(),
                 cpu.scheduler.len(), cpu.scheduler.has_blocked_vcpus());
         }
     } else {
+        #[cfg(feature = "vcpu_debug_trace")]
         if sched_n % 10000 == 0 {
             info!("[SCH] #{} slowpath no-current rq={} blocked={}",
                 sched_n, cpu.scheduler.len(), cpu.scheduler.has_blocked_vcpus());
@@ -543,6 +546,7 @@ pub fn schedule() {
     loop {
         let next_vcpu = pick_next_or_idle(prev_zone_id);
 
+        #[cfg(feature = "vcpu_debug_trace")]
         if sched_n % 10000 == 0 {
             let cpu = this_cpu_data();
             info!("[SCH] #{} picked={:?} rq={} blocked={}",
@@ -561,6 +565,7 @@ pub fn schedule() {
                 break;
             }
 
+            #[cfg(feature = "vcpu_debug_trace")]
             {
                 use core::sync::atomic::{AtomicU64, Ordering};
                 static SWITCH_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -572,11 +577,13 @@ pub fn schedule() {
 
             cpu.scheduler.time_slice_remaining = DEFAULT_TIME_SLICE;
             cpu.scheduler.current = Some(next_vcpu.clone());
+            #[cfg(feature = "vcpu_debug_trace")]
             if sched_n % 10000 == 0 {
                 info!("[SCH] #{} sched_cur set -> vcpu={}", sched_n, next_vcpu.id);
             }
 
             vcpu_switch_in(&next_vcpu, prev_zone_id);
+            #[cfg(feature = "vcpu_debug_trace")]
             if sched_n % 10000 == 0 {
                 info!("[SCH] #{} switch_in done vcpu={}", sched_n, next_vcpu.id);
             }
@@ -585,6 +592,7 @@ pub fn schedule() {
 
             // Update percpu current_vcpu
             cpu.current_vcpu = Some(next_vcpu);
+            #[cfg(feature = "vcpu_debug_trace")]
             if sched_n % 10000 == 0 {
                 info!("[SCH] #{} current_vcpu set, returning", sched_n);
             }
@@ -605,6 +613,7 @@ fn pick_next_or_idle(prev_zone_id: Option<usize>) -> Option<Arc<VCpu>> {
         return Some(vcpu);
     }
 
+    #[cfg(feature = "vcpu_debug_trace")]
     {
         use core::sync::atomic::{AtomicU64, Ordering};
         static IDLE_ENTER: AtomicU64 = AtomicU64::new(0);
@@ -619,8 +628,14 @@ fn pick_next_or_idle(prev_zone_id: Option<usize>) -> Option<Arc<VCpu>> {
 
 /// EL2 idle loop — the pCPU sleeps here until a VCpu becomes Ready.
 ///
-/// Executes at EL2 with IRQs enabled. EL2 IRQ vector fires on physical IRQ,
-/// calls `gic_handle_irq()` then erets back here.
+/// Executes at EL2 with IRQs masked at PSTATE.DAIF. ARM v8 guarantees that
+/// pending physical IRQs wake WFI even when masked (D1.16.2). We mask first
+/// to avoid the daifclr→wfi lost-wakeup race: if an IRQ arrives between the
+/// unmask and the wfi instruction, the EL2 IRQ handler runs and clears the
+/// pending bit, after which wfi truly sleeps until the next IRQ.
+///
+/// After wfi returns we briefly unmask (with isb) so the EL2 IRQ handler can
+/// run on the queued interrupt, then re-mask before scheduler-state work.
 #[cfg(target_arch = "aarch64")]
 fn el2_idle_loop() -> Option<Arc<VCpu>> {
     use aarch64_cpu::asm::wfi;
@@ -630,6 +645,9 @@ fn el2_idle_loop() -> Option<Arc<VCpu>> {
     // Clear TPIDR_EL2 so _el2h_irq_entry knows no guest is in EL1 right now.
     // vmreturn() will set it again to the TrapFrame ptr before next eret to EL1.
     unsafe { core::arch::asm!("msr TPIDR_EL2, xzr", options(nostack, preserves_flags)) };
+    // Mask IRQ/FIQ at PSTATE — we will only briefly unmask to drain handlers
+    // after each wfi returns.
+    unsafe { core::arch::asm!("msr daifset, #0xf", options(nostack, preserves_flags)) };
 
     loop {
         let cpu = this_cpu_data();
@@ -649,34 +667,19 @@ fn el2_idle_loop() -> Option<Arc<VCpu>> {
             crate::arch::timer::el2_timer_disable();
         }
 
-        // Enable IRQs so physical interrupts are delivered via _el2_irq_handler.
-        unsafe { core::arch::asm!("msr daifclr, #0xf") };
-
-        wfi(); // Real hardware WFI
-
-        // Disable IRQs before touching scheduler state.
-        unsafe { core::arch::asm!("msr daifset, #0xf") };
-
-        // Unconditionally drain incoming VCPUs after WFI.
+        // Drain any pending incoming vCPUs and check blocked-timer expirations
+        // before going to sleep, so we don't miss a wakeup that was delivered
+        // while IRQs were masked.
         crate::vcpu::drain_incoming_vcpus();
-
-        // Explicitly check blocked vCPU timers — EL2 timer may have been armed
-        // at a blocked vCPU's far-future deadline, so sched_tick_handler may not
-        // have run yet. This ensures absolute_timeout and has_pending_irqs() wakeups
-        // fire promptly regardless of the EL2 timer target.
-        let cpu = this_cpu_data();
         let current_cnt = crate::arch::timer::current_cntpct();
         let woken = cpu.scheduler.check_blocked_timers(current_cnt);
         if woken > 0 {
             cpu.need_resched.store(true, Ordering::Release);
         }
-
-        let cpu = this_cpu_data();
         if let Some(vcpu) = cpu.scheduler.pick_next() {
             trace!("[IDLE] pcpu={} woke up, picked vcpu={}", cpu.id, vcpu.id);
             return Some(vcpu);
         }
-
         if cpu.need_resched.load(Ordering::Acquire) {
             cpu.need_resched.store(false, Ordering::Release);
             if let Some(vcpu) = cpu.scheduler.pick_next() {
@@ -684,10 +687,27 @@ fn el2_idle_loop() -> Option<Arc<VCpu>> {
                 return Some(vcpu);
             }
         }
+
+        // ARM v8 D1.16.2: WFI wakes on pending IRQ/FIQ regardless of PSTATE.{I,F}.
+        wfi();
+
+        // Briefly unmask so the queued interrupt can run its handler, then mask
+        // again before we touch scheduler state on the next iteration.
+        unsafe {
+            core::arch::asm!(
+                "msr daifclr, #0xf",
+                "isb",
+                "msr daifset, #0xf",
+                options(nostack, preserves_flags),
+            );
+        }
+
+        #[cfg(feature = "vcpu_debug_trace")]
         {
-            use core::sync::atomic::{AtomicU64, Ordering};
+            use core::sync::atomic::{AtomicU64, Ordering as O};
             static IDLE_NOWAKE: AtomicU64 = AtomicU64::new(0);
-            let n = IDLE_NOWAKE.fetch_add(1, Ordering::Relaxed);
+            let cpu = this_cpu_data();
+            let n = IDLE_NOWAKE.fetch_add(1, O::Relaxed);
             if n % 10000 == 0 {
                 info!("[IDLE] pcpu={} WFI wake but no vcpu #{}: rq={} blocked={}",
                     cpu.id, n, cpu.scheduler.len(), cpu.scheduler.blocked_vcpu_count());
