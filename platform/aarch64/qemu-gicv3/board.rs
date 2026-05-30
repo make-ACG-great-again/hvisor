@@ -54,6 +54,12 @@ pub const ROOT_ZONE_KERNEL_ADDR: u64 = 0xa0400000;
 pub const ROOT_ZONE_ENTRY: u64 = 0xa0400000;
 pub const ROOT_ZONE_CPUS: u64 = (1 << 0) | (1 << 1);
 
+/// Number of vCPUs for root zone.
+/// 0 = auto (1:1, one vCPU per pCPU in `ROOT_ZONE_CPUS`).
+/// >0 = explicit (overcommit if > popcount(ROOT_ZONE_CPUS)).
+/// Bounded by `MAX_VCPUS_PER_ZONE` (=64).
+pub const ROOT_ZONE_NUM_VCPUS: u64 = 4;
+
 pub const ROOT_ZONE_NAME: &str = "root-linux";
 
 pub const ROOT_ZONE_MEMORY_REGIONS: &[HvConfigMemoryRegion] = &[

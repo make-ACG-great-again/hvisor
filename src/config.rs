@@ -106,7 +106,28 @@ pub struct HvZoneConfig {
     pub pci_config: [HvPciConfig; CONFIG_PCI_BUS_MAXNUM],
     pub num_pci_devs: u64,
     pub alloc_pci_devs: [HvPciDevConfig; CONFIG_MAX_PCI_DEV],
+    /// Number of vCPUs to create for this zone.
+    /// 0 = auto (1:1, one vCPU per pCPU in `cpus`).
+    /// >0 = explicit count (allows 1:N overcommit or undersubscription).
+    /// Bounded by `MAX_VCPUS_PER_ZONE`.
+    /// Field appended at struct tail; legacy tools that memcpy a smaller
+    /// struct leave this zero (auto), preserving 1:1 behavior.
+    pub num_vcpus: u64,
 }
+
+/// Hard upper bound on vCPUs per zone (defense against config errors / OOM).
+pub const MAX_VCPUS_PER_ZONE: usize = 64;
+
+/// Legacy `HvZoneConfig` byte size, before the `num_vcpus` field was appended.
+/// Used by `hv_zone_start` to accept old-tool payloads (missing trailing
+/// `num_vcpus`) and default that field to 0 (= auto 1:1).
+///
+/// Any future trailing fields MUST update this with care: only trailing fields
+/// whose zero-value is a safe default may be omitted by legacy tools. If a
+/// new mandatory field is added, bump `CONFIG_MAGIC_VERSION` and remove the
+/// legacy size from the accepted set in `hv_zone_start`.
+pub const LEGACY_CONFIG_SIZE_V0X5: usize =
+    core::mem::size_of::<HvZoneConfig>() - core::mem::size_of::<u64>();
 
 impl HvZoneConfig {
     pub fn new(
@@ -149,6 +170,7 @@ impl HvZoneConfig {
             pci_config: pci,
             num_pci_devs: num_pci_devs,
             alloc_pci_devs: alloc_pci_devs,
+            num_vcpus: 0, // auto = 1:1; set after construction if overriding
         }
     }
 
@@ -172,10 +194,36 @@ impl HvZoneConfig {
     }
 
     /// Return the number of vCPUs to create for this zone.
-    /// TEST (2:4 overcommit): 2 pCPUs each host 2 vCPUs = 4 vCPUs total.
-    /// Revert to `self.cpus().len()` for normal 1:1 operation.
+    ///
+    /// - `num_vcpus == 0` → auto = 1:1 (one vCPU per pCPU in `cpus`).
+    /// - `num_vcpus > 0`  → explicit count, honored only when the
+    ///   `vcpu_overcommit` cargo feature is enabled (per-board opt-in).
+    ///   When the feature is off, an explicit value is logged and ignored
+    ///   (falls back to auto 1:1) — this prevents untested boards from
+    ///   accidentally booting in overcommit mode.
+    ///
+    /// Result is clamped to `MAX_VCPUS_PER_ZONE`.
     pub fn num_vcpus(&self) -> usize {
-        self.cpus().len() * 2
+        let n = if self.num_vcpus == 0 {
+            self.cpus().len()
+        } else {
+            #[cfg(feature = "vcpu_overcommit")]
+            {
+                self.num_vcpus as usize
+            }
+            #[cfg(not(feature = "vcpu_overcommit"))]
+            {
+                warn!(
+                    "zone {} num_vcpus={} requested but `vcpu_overcommit` feature is off; \
+                     falling back to auto 1:1 ({})",
+                    self.zone_id,
+                    self.num_vcpus,
+                    self.cpus().len()
+                );
+                self.cpus().len()
+            }
+        };
+        n.min(MAX_VCPUS_PER_ZONE)
     }
 
     pub fn ivc_config(&self) -> &[HvIvcConfig] {

@@ -60,6 +60,8 @@ pub const ROOT_ZONE_KERNEL_ADDR: u64 = 0x90000000;
 // ROOT_ZONE_ENTRY is GPA (Guest Physical Address).
 pub const ROOT_ZONE_ENTRY: u64 = 0x90000000;
 pub const ROOT_ZONE_CPUS: u64 = 0x3; // core0,1,2,3
+/// vCPU count override; 0 = auto 1:1. Honored only with `vcpu_overcommit` feature.
+pub const ROOT_ZONE_NUM_VCPUS: u64 = 0;
 #[rustfmt::skip]
 pub const ROOT_ZONE_MEMORY_REGIONS: &[HvConfigMemoryRegion] = &[
     // Main memory (~32GB), reserved 0x500_0000 (80M) for high-level privilege softwares (opensbi & hvisor).

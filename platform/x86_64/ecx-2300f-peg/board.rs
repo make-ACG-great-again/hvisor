@@ -28,6 +28,8 @@ pub const ROOT_ZONE_ENTRY: u64 = 0x8000;
 pub const ROOT_ZONE_KERNEL_ADDR: u64 = 0x500_0000; // hpa
 pub const ROOT_ZONE_CPUS: u64 =
     (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7);
+/// vCPU count override; 0 = auto 1:1. Honored only with `vcpu_overcommit` feature.
+pub const ROOT_ZONE_NUM_VCPUS: u64 = 0;
 
 const ROOT_ZONE_RSDP_REGION: HvConfigMemoryRegion = HvConfigMemoryRegion {
     mem_type: MEM_TYPE_RAM,

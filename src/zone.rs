@@ -578,6 +578,26 @@ pub fn zone_create(config: &HvZoneConfig) -> HvResult<Arc<Zone>> {
         let total_vcpus = config.num_vcpus();
 
         assert!(num_pcpus > 0, "zone {} has empty cpu_set", zone_id);
+        assert!(
+            total_vcpus > 0,
+            "zone {} resolved to 0 vcpus (cpu_set empty?)",
+            zone_id
+        );
+        assert!(
+            total_vcpus <= crate::config::MAX_VCPUS_PER_ZONE,
+            "zone {} num_vcpus={} exceeds MAX_VCPUS_PER_ZONE={}",
+            zone_id,
+            total_vcpus,
+            crate::config::MAX_VCPUS_PER_ZONE
+        );
+        info!(
+            "zone {} vcpu allocation: {} vcpu(s) over {} pcpu(s) (config.num_vcpus={}, mode={})",
+            zone_id,
+            total_vcpus,
+            num_pcpus,
+            config.num_vcpus,
+            if config.num_vcpus == 0 { "auto-1:1" } else { "explicit" }
+        );
 
         let mut vcpu_base = usize::MAX;
 

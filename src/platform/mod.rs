@@ -86,7 +86,7 @@ pub fn platform_root_zone_config() -> HvZoneConfig {
         _num_pci_bus = ROOT_PCI_CONFIG.len() as _;
     }
 
-    HvZoneConfig::new(
+    let mut cfg = HvZoneConfig::new(
         0,
         ROOT_ZONE_CPUS,
         ROOT_ZONE_MEMORY_REGIONS.len() as u32,
@@ -105,5 +105,11 @@ pub fn platform_root_zone_config() -> HvZoneConfig {
         _root_pci_cfg,
         _num_pci_devs,
         pci_devs,
-    )
+    );
+
+    // Optional overcommit / undersubscription for root zone.
+    // Sourced from board.rs `ROOT_ZONE_NUM_VCPUS`.
+    // 0 = auto (1:1, one vCPU per pCPU in cpu_set).
+    cfg.num_vcpus = ROOT_ZONE_NUM_VCPUS;
+    cfg
 }

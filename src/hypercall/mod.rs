@@ -176,25 +176,50 @@ impl<'a> HyperCall<'a> {
     pub fn hv_zone_start(&mut self, config: &HvZoneConfig, config_size: u64) -> HyperCallResult {
         let config_ipa = config as *const HvZoneConfig as u64;
         let config_pa = self.hv_get_real_pa(config_ipa);
-        let config = unsafe { &*(config_pa as *const HvZoneConfig) };
 
-        debug!("hv_zone_start: config: {:#x?}", config);
+        debug!("hv_zone_start: config_pa={:#x}, size={}", config_pa, config_size);
         if !is_this_root_zone() {
             return hv_result_err!(
                 EPERM,
                 "Start zone operation over non-root zones: unsupported!"
             );
         }
-        if config_size != core::mem::size_of::<HvZoneConfig>() as _ {
+        // ABI-compatible size check: accept exactly one of two sizes.
+        //  - current  = sizeof::<HvZoneConfig>()         (new tool, all fields)
+        //  - legacy   = LEGACY_CONFIG_SIZE_V0X5          (old tool, missing
+        //                                                 trailing `num_vcpus`)
+        // Anything else is rejected — prevents truncation of any non-trailing
+        // field. When more trailing fields are appended in the future, this
+        // whitelist must be updated explicitly (or a magic-version bump used).
+        let current_size = core::mem::size_of::<HvZoneConfig>() as u64;
+        let legacy_size = crate::config::LEGACY_CONFIG_SIZE_V0X5 as u64;
+        if config_size != current_size && config_size != legacy_size {
             return hv_result_err!(
                 EINVAL,
                 format!(
-                    "hv_zone_start: config size should be {} bytes, but got {}",
-                    core::mem::size_of::<HvZoneConfig>(),
-                    config_size
+                    "hv_zone_start: config size {} not in accepted set [{}, {}]",
+                    config_size, legacy_size, current_size
                 )
             );
         }
+        // Stage into a zero-initialized local struct so the missing trailing
+        // `num_vcpus` field reads as 0 (= auto 1:1) for legacy tools.
+        let mut staged: HvZoneConfig = unsafe { core::mem::zeroed() };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                config_pa as *const u8,
+                &mut staged as *mut HvZoneConfig as *mut u8,
+                config_size as usize,
+            );
+        }
+        if config_size == legacy_size {
+            info!(
+                "hv_zone_start: legacy tool ABI (size={}); num_vcpus defaulted to 0 (auto 1:1)",
+                config_size
+            );
+        }
+        let config = &staged;
+        debug!("hv_zone_start: config: {:#x?}", config);
         let zone = zone_create(config)?;
         let boot_cpu = zone.read().cpu_set().first_cpu().unwrap();
 

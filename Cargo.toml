@@ -54,6 +54,7 @@ pci = [] # supported by: aarch64, riscv64,loongarch64
 share_s2pt = ["iommu"]
 print_timestamp = [] # print timestamp when logging
 vcpu_debug_trace = [] # enable high-frequency vCPU/GIC/IRQ debug counters and logs (off by default)
+vcpu_overcommit = [] # opt-in: honor explicit `HvZoneConfig.num_vcpus` (>0) for 1:N overcommit; off => always auto 1:1
 
 ############# IOMMU ##############
 riscv_iommu = ["iommu"]
